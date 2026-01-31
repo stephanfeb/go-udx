@@ -109,8 +109,12 @@ func TestConnection_AcceptStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ID != 5 {
-		t.Fatalf("accepted stream ID: got %d, want 5", s.ID)
+	// Server assigns its own local ID (2 for responder), remote ID is the sender's stream ID
+	if s.ID != 2 {
+		t.Fatalf("accepted stream local ID: got %d, want 2", s.ID)
+	}
+	if s.RemoteID != 5 {
+		t.Fatalf("accepted stream remote ID: got %d, want 5", s.RemoteID)
 	}
 }
 

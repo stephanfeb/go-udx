@@ -99,3 +99,91 @@ func TestDial(t *testing.T) {
 		t.Fatal("expected connection")
 	}
 }
+
+func TestMultiplexer_DialAcceptStream(t *testing.T) {
+	// Server
+	serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	serverUDP, _ := net.ListenUDP("udp4", serverAddr)
+	server := NewMultiplexer(serverUDP, RealClock{})
+	defer server.Close()
+
+	// Client
+	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	clientUDP, _ := net.ListenUDP("udp4", clientAddr)
+	client := NewMultiplexer(clientUDP, RealClock{})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Dial
+	conn, err := client.Dial(ctx, server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept on server
+	srvConn, err := server.Accept(ctx)
+	if err != nil {
+		t.Fatalf("server accept: %v", err)
+	}
+
+	t.Logf("client conn state: %d, server conn state: %d", conn.State(), srvConn.State())
+	t.Logf("server connections: %d", server.ConnectionCount())
+}
+
+func TestMultiplexer_DialAcceptStreamEcho(t *testing.T) {
+	// Server
+	serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	serverUDP, _ := net.ListenUDP("udp4", serverAddr)
+	server := NewMultiplexer(serverUDP, RealClock{})
+	defer server.Close()
+
+	// Client
+	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	clientUDP, _ := net.ListenUDP("udp4", clientAddr)
+	client := NewMultiplexer(clientUDP, RealClock{})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _ := client.Dial(ctx, server.Addr())
+	srvConn, _ := server.Accept(ctx)
+
+	// Open stream on client
+	stream, err := conn.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write data
+	_, err = stream.Write([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.CloseWrite()
+
+	// Accept stream on server
+	srvStream, err := srvConn.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept stream: %v", err)
+	}
+
+	buf := make([]byte, 100)
+	n, _ := srvStream.Read(buf)
+	t.Logf("server read: %q", buf[:n])
+
+	// Echo back
+	srvStream.Write(buf[:n])
+	srvStream.CloseWrite()
+
+	// Client read echo
+	buf2 := make([]byte, 100)
+	n2, _ := stream.Read(buf2)
+	t.Logf("client read echo: %q", buf2[:n2])
+
+	if string(buf2[:n2]) != "hello" {
+		t.Fatalf("echo mismatch: got %q", buf2[:n2])
+	}
+}

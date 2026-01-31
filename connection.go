@@ -134,7 +134,7 @@ func (c *Connection) OpenStream(ctx context.Context) (*Stream, error) {
 	fc := NewStreamFlowController(int64(InitialMaxStreamData), int64(InitialMaxStreamData))
 	s := NewStream(id, 0, fc) // remoteID set during handshake
 	s.conn = c
-	s.state = StreamStateOpen
+	// Leave state as Idle so the first Write sends a SYN frame
 	c.streams[id] = s
 	return s, nil
 }
@@ -215,12 +215,14 @@ func (c *Connection) sendStreamFrame(streamID, remoteID uint32, data []byte, isF
 		IsSyn: isSyn,
 		Data:  data,
 	}
-	c.sendPacket(streamID, remoteID, []Frame{frame})
+	// DstStreamID = remote's stream ID, SrcStreamID = our local stream ID
+	c.sendPacket(remoteID, streamID, []Frame{frame})
 }
 
 func (c *Connection) sendResetStream(streamID, remoteID uint32, errorCode uint32) {
 	frame := &ResetStreamFrame{ErrorCode: errorCode}
-	c.sendPacket(streamID, remoteID, []Frame{frame})
+	// DstStreamID = remote's stream ID, SrcStreamID = our local stream ID
+	c.sendPacket(remoteID, streamID, []Frame{frame})
 }
 
 func (c *Connection) clock() Clock { return c.clk }
@@ -334,17 +336,34 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 }
 
 func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
-	streamID := pkt.SourceStreamID
+	// DstStreamID = our local stream ID (0 if SYN for new stream)
+	// SrcStreamID = remote peer's local stream ID
+	localStreamID := pkt.DestinationStreamID
+	remoteStreamID := pkt.SourceStreamID
 
 	c.mu.Lock()
-	s, ok := c.streams[streamID]
-	if !ok && f.IsSyn {
-		// Incoming stream
+	// Try to find stream by our local ID first
+	s, ok := c.streams[localStreamID]
+	if !ok && remoteStreamID != 0 {
+		// Try to find by remote stream ID
+		for _, candidate := range c.streams {
+			if candidate.RemoteID == remoteStreamID {
+				s = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok && f.IsSyn && remoteStreamID != 0 {
+		// Incoming stream — assign a new local ID, use remote's ID as RemoteID
+		id := c.nextStreamID
+		c.nextStreamID += 2
+
 		fc := NewStreamFlowController(int64(InitialMaxStreamData), int64(InitialMaxStreamData))
-		s = NewStream(streamID, pkt.SourceStreamID, fc)
+		s = NewStream(id, remoteStreamID, fc)
 		s.conn = c
 		s.state = StreamStateOpen
-		c.streams[streamID] = s
+		c.streams[id] = s
 		c.mu.Unlock()
 
 		select {

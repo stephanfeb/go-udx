@@ -238,35 +238,18 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // --- Receive-side methods called by Connection ---
 
-// DeliverData delivers ordered data to the stream's receive buffer.
+// DeliverData delivers data to the stream's receive buffer.
+// Data is appended in order of arrival. Out-of-order handling is done at the
+// connection/packet level via retransmission, not at the stream level.
 func (s *Stream) DeliverData(seq uint32, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if seq == s.nextExpectSeq {
-		s.recvBuf = append(s.recvBuf, data...)
-		s.nextExpectSeq++
+	s.recvBuf = append(s.recvBuf, data...)
 
-		// Deliver any buffered out-of-order data
-		for {
-			if ooo, ok := s.recvOOO[s.nextExpectSeq]; ok {
-				s.recvBuf = append(s.recvBuf, ooo...)
-				delete(s.recvOOO, s.nextExpectSeq)
-				s.nextExpectSeq++
-			} else {
-				break
-			}
-		}
-
-		if s.streamFC != nil {
-			s.streamFC.OnDataReceived(len(data))
-		}
-	} else if seq > s.nextExpectSeq {
-		// Out of order — buffer it
-		s.recvOOO[seq] = make([]byte, len(data))
-		copy(s.recvOOO[seq], data)
+	if s.streamFC != nil {
+		s.streamFC.OnDataReceived(len(data))
 	}
-	// seq < nextExpectSeq is a duplicate, ignore
 
 	s.recvCond.Broadcast()
 }

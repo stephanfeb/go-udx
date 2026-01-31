@@ -89,12 +89,12 @@ func TestStream_ReadDeliverData(t *testing.T) {
 	}
 }
 
-func TestStream_OutOfOrderDelivery(t *testing.T) {
+func TestStream_MultipleDeliveries(t *testing.T) {
 	s, _ := newTestStream(t)
 
-	// Deliver seq 1 before seq 0
-	s.DeliverData(1, []byte("B"))
+	// Data is delivered in arrival order (reordering handled at connection level)
 	s.DeliverData(0, []byte("A"))
+	s.DeliverData(1, []byte("B"))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)

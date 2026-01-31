@@ -70,6 +70,15 @@ func (m *Multiplexer) Dial(ctx context.Context, addr net.Addr) (*Connection, err
 	m.connections[localCID.String()] = c
 	m.mu.Unlock()
 
+	// Send a SYN packet to initiate the connection
+	c.mu.Lock()
+	c.state = ConnStateEstablished
+	c.addrValidated = true // initiator knows the address
+	c.mu.Unlock()
+
+	// Send SYN frame so the remote multiplexer creates the connection
+	c.sendFrames([]Frame{&StreamFrame{IsSyn: true}})
+
 	return c, nil
 }
 
