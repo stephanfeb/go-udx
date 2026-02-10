@@ -55,6 +55,10 @@ type Connection struct {
 	pathChallenge     [8]byte
 	pathChallengeResp chan [8]byte
 
+	// Receive-side packet deduplication
+	seenPackets  map[uint32]struct{}
+	highWaterSeq uint32
+
 	// Anti-amplification
 	bytesSent     int64
 	bytesReceived int64
@@ -88,7 +92,8 @@ func NewConnection(
 		isInitiator:    isInitiator,
 		maxStreams:      InitialMaxStreams,
 		incomingStreams: make(chan *Stream, 16),
-		pmtud:          NewPMTUDController(),
+		pmtud:        NewPMTUDController(),
+		seenPackets:  make(map[uint32]struct{}),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
@@ -174,11 +179,16 @@ func (c *Connection) CloseWithError(code uint32, reason string) error {
 		c.state = ConnStateClosed
 		close(c.closeCh)
 
-		// Close all streams
+		// Collect streams under lock, then reset without lock to avoid deadlock
+		streams := make([]*Stream, 0, len(c.streams))
 		for _, s := range c.streams {
-			s.DeliverReset(code)
+			streams = append(streams, s)
 		}
 		c.mu.Unlock()
+
+		for _, s := range streams {
+			s.DeliverReset(code)
+		}
 
 		c.cc.Destroy()
 		c.pm.Destroy()
@@ -271,14 +281,62 @@ func (c *Connection) sendFrames(frames []Frame) {
 	c.sendPacket(0, 0, frames)
 }
 
-// HandlePacket processes an incoming packet.
+// HandlePacket processes an incoming packet with deduplication.
+// Tracks seen packet sequences to prevent duplicate data delivery, which
+// corrupts the Noise encryption layer (chacha20poly1305 MAC failures).
 func (c *Connection) HandlePacket(pkt *Packet) {
 	c.mu.Lock()
 	c.bytesReceived += int64(len(MarshalPacket(pkt))) // approximate
+
+	seq := pkt.Sequence
+
+	if _, seen := c.seenPackets[seq]; seen {
+		// Duplicate packet — still ACK (original ACK may have been lost)
+		// but do NOT deliver stream data again.
+		c.mu.Unlock()
+		// Process only ACK frames (idempotent) from duplicates
+		for _, frame := range pkt.Frames {
+			if f, ok := frame.(*AckFrame); ok {
+				c.handleAckFrame(f)
+			}
+		}
+		// Re-send ACK so sender stops retransmitting
+		if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
+			c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{&AckFrame{
+				LargestAcked:        pkt.Sequence,
+				AckDelay:            0,
+				FirstAckRangeLength: 1,
+			}})
+		}
+		return
+	}
+
+	// Mark as seen
+	c.seenPackets[seq] = struct{}{}
+	if seq > c.highWaterSeq {
+		c.highWaterSeq = seq
+	}
+	// Prevent unbounded memory growth: trim entries far below high water mark
+	if len(c.seenPackets) > 1000 {
+		threshold := c.highWaterSeq - 500
+		for s := range c.seenPackets {
+			if s < threshold {
+				delete(c.seenPackets, s)
+			}
+		}
+	}
 	c.mu.Unlock()
 
+	// Process all frames and send ACK
 	for _, frame := range pkt.Frames {
 		c.handleFrame(pkt, frame)
+	}
+	if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
+		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{&AckFrame{
+			LargestAcked:        pkt.Sequence,
+			AckDelay:            0,
+			FirstAckRangeLength: 1,
+		}})
 	}
 }
 

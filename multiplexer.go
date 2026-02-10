@@ -184,7 +184,7 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 		})
 	newConn.mu.Lock()
 	newConn.state = ConnStateEstablished
-	newConn.addrValidated = false // Anti-amplification until validated
+	newConn.addrValidated = true // Validated by receiving a valid SYN
 	newConn.mu.Unlock()
 
 	m.mu.Lock()

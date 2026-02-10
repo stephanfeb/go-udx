@@ -116,12 +116,13 @@ func (s *Stream) Read(p []byte) (int, error) {
 // Write writes data to the stream. Fragments by MTU and applies back-pressure.
 func (s *Stream) Write(p []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.state == StreamStateReset {
+		s.mu.Unlock()
 		return 0, ErrStreamReset
 	}
 	if s.state == StreamStateHalfClosedLocal || s.state == StreamStateClosed {
+		s.mu.Unlock()
 		return 0, ErrWriteAfterClose
 	}
 
@@ -132,9 +133,11 @@ func (s *Stream) Write(p []byte) (int, error) {
 		// Wait for flow control
 		for s.streamFC != nil && !s.streamFC.CanSend(1) {
 			if s.state == StreamStateReset {
+				s.mu.Unlock()
 				return total, ErrStreamReset
 			}
 			if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
+				s.mu.Unlock()
 				return total, ErrDeadlineExceeded
 			}
 			s.sendCond.Wait()
@@ -149,37 +152,42 @@ func (s *Stream) Write(p []byte) (int, error) {
 		chunk := make([]byte, chunkSize)
 		copy(chunk, data[:chunkSize])
 
-		if s.conn != nil {
-			isSyn := s.state == StreamStateIdle
-			s.conn.sendStreamFrame(s.ID, s.RemoteID, chunk, false, isSyn)
-			if isSyn {
-				s.state = StreamStateOpen
-			}
+		conn := s.conn
+		id, remoteID := s.ID, s.RemoteID
+		isSyn := s.state == StreamStateIdle
+		if isSyn {
+			s.state = StreamStateOpen
 		}
 
 		if s.streamFC != nil {
 			s.streamFC.OnDataSent(chunkSize)
 		}
 
+		s.BytesWritten += int64(chunkSize)
+		s.mu.Unlock()
+
+		// Send without holding s.mu to avoid deadlock with c.mu
+		if conn != nil {
+			conn.sendStreamFrame(id, remoteID, chunk, false, isSyn)
+		}
+
 		data = data[chunkSize:]
 		total += chunkSize
-		s.BytesWritten += int64(chunkSize)
+
+		s.mu.Lock()
 	}
 
+	s.mu.Unlock()
 	return total, nil
 }
 
 // Close sends a FIN and closes the write side.
 func (s *Stream) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.state == StreamStateClosed || s.state == StreamStateReset {
+		s.mu.Unlock()
 		return nil
-	}
-
-	if s.conn != nil {
-		s.conn.sendStreamFrame(s.ID, s.RemoteID, nil, true, false)
 	}
 
 	if s.state == StreamStateHalfClosedRemote {
@@ -188,7 +196,15 @@ func (s *Stream) Close() error {
 		s.state = StreamStateHalfClosedLocal
 	}
 
+	conn := s.conn
+	id, remoteID := s.ID, s.RemoteID
 	s.recvCond.Broadcast()
+	s.mu.Unlock()
+
+	// Send FIN without holding s.mu to avoid deadlock with c.mu
+	if conn != nil {
+		conn.sendStreamFrame(id, remoteID, nil, true, false)
+	}
 	return nil
 }
 
@@ -200,21 +216,25 @@ func (s *Stream) CloseWrite() error {
 // Reset sends a RESET_STREAM frame with the given error code.
 func (s *Stream) Reset(errorCode uint32) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.state == StreamStateClosed || s.state == StreamStateReset {
+		s.mu.Unlock()
 		return nil
 	}
 
 	s.state = StreamStateReset
 	s.resetCode = errorCode
 
-	if s.conn != nil {
-		s.conn.sendResetStream(s.ID, s.RemoteID, errorCode)
-	}
-
+	conn := s.conn
+	id, remoteID := s.ID, s.RemoteID
 	s.sendCond.Broadcast()
 	s.recvCond.Broadcast()
+	s.mu.Unlock()
+
+	// Send reset without holding s.mu to avoid deadlock with c.mu
+	if conn != nil {
+		conn.sendResetStream(id, remoteID, errorCode)
+	}
 	return nil
 }
 
@@ -239,8 +259,8 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // --- Receive-side methods called by Connection ---
 
 // DeliverData delivers data to the stream's receive buffer.
-// Data is appended in order of arrival. Out-of-order handling is done at the
-// connection/packet level via retransmission, not at the stream level.
+// Deduplication is handled at the connection level (Connection.HandlePacket),
+// so data arriving here is already guaranteed to be non-duplicate and in order.
 func (s *Stream) DeliverData(seq uint32, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
