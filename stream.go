@@ -68,6 +68,7 @@ type Stream struct {
 type streamConn interface {
 	sendStreamFrame(streamID uint32, remoteID uint32, data []byte, isFin bool, isSyn bool)
 	sendResetStream(streamID uint32, remoteID uint32, errorCode uint32)
+	sendWindowUpdate(streamID uint32, remoteID uint32, windowSize int)
 	clock() Clock
 }
 
@@ -263,15 +264,26 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // so data arriving here is already guaranteed to be non-duplicate and in order.
 func (s *Stream) DeliverData(seq uint32, data []byte) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.recvBuf = append(s.recvBuf, data...)
 
+	var sendUpdate bool
 	if s.streamFC != nil {
-		s.streamFC.OnDataReceived(len(data))
+		sendUpdate = s.streamFC.OnDataReceived(len(data))
 	}
 
+	conn := s.conn
+	id, remoteID := s.ID, s.RemoteID
 	s.recvCond.Broadcast()
+	s.mu.Unlock()
+
+	// Send window update without holding s.mu to avoid deadlock with c.mu.
+	// Without this, the peer's stream flow controller blocks after exhausting
+	// the initial 64KB window — killing the entire yamux mux on this stream.
+	if sendUpdate && s.streamFC != nil && conn != nil {
+		newWindow := s.streamFC.GrowRecvWindow()
+		conn.sendWindowUpdate(id, remoteID, int(newWindow))
+	}
 }
 
 // DeliverFin marks the remote side as closed.

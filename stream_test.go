@@ -9,10 +9,11 @@ import (
 
 // mockStreamConn implements streamConn for testing.
 type mockStreamConn struct {
-	mu      sync.Mutex
-	sent    []mockSentFrame
-	resets  []mockReset
-	clk     Clock
+	mu            sync.Mutex
+	sent          []mockSentFrame
+	resets        []mockReset
+	windowUpdates []mockWindowUpdate
+	clk           Clock
 }
 
 type mockSentFrame struct {
@@ -24,6 +25,11 @@ type mockSentFrame struct {
 type mockReset struct {
 	streamID, remoteID uint32
 	errorCode          uint32
+}
+
+type mockWindowUpdate struct {
+	streamID, remoteID uint32
+	windowSize         int
 }
 
 func (m *mockStreamConn) sendStreamFrame(streamID, remoteID uint32, data []byte, isFin, isSyn bool) {
@@ -38,6 +44,12 @@ func (m *mockStreamConn) sendResetStream(streamID, remoteID uint32, errorCode ui
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.resets = append(m.resets, mockReset{streamID, remoteID, errorCode})
+}
+
+func (m *mockStreamConn) sendWindowUpdate(streamID, remoteID uint32, windowSize int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.windowUpdates = append(m.windowUpdates, mockWindowUpdate{streamID, remoteID, windowSize})
 }
 
 func (m *mockStreamConn) clock() Clock { return m.clk }

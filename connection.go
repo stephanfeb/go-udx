@@ -235,7 +235,33 @@ func (c *Connection) sendResetStream(streamID, remoteID uint32, errorCode uint32
 	c.sendPacket(remoteID, streamID, []Frame{frame})
 }
 
+func (c *Connection) sendWindowUpdate(streamID, remoteID uint32, windowSize int) {
+	frame := &WindowUpdateFrame{WindowSize: uint32(windowSize)}
+	c.sendPacket(remoteID, streamID, []Frame{frame})
+}
+
 func (c *Connection) clock() Clock { return c.clk }
+
+// findStream looks up a stream by local ID first, then falls back to searching
+// by remote ID. This is needed because the Dart UDX transport assigns random
+// stream IDs that don't match Go's sequential IDs — the DestinationStreamID in
+// packets from Dart may not match our local stream ID.
+func (c *Connection) findStream(localID, remoteID uint32) *Stream {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if s, ok := c.streams[localID]; ok {
+		return s
+	}
+	if remoteID != 0 {
+		for _, s := range c.streams {
+			if s.RemoteID == remoteID {
+				return s
+			}
+		}
+	}
+	return nil
+}
 
 // --- Packet handling ---
 
@@ -347,11 +373,11 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 	case *AckFrame:
 		c.handleAckFrame(f)
 	case *WindowUpdateFrame:
-		c.handleWindowUpdate(pkt.SourceStreamID, f)
+		c.handleWindowUpdate(pkt, f)
 	case *MaxDataFrame:
 		c.fc.UpdateMaxData(int64(f.MaxData))
 	case *ResetStreamFrame:
-		c.handleResetStream(pkt.SourceStreamID, f)
+		c.handleResetStream(pkt, f)
 	case *ConnectionCloseFrame:
 		c.Close()
 	case *PingFrame:
@@ -378,18 +404,20 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 	case *MTUProbeFrame:
 		// Respond via ACK
 	case *StopSendingFrame:
-		c.mu.Lock()
-		if s, ok := c.streams[pkt.DestinationStreamID]; ok {
-			c.mu.Unlock()
+		if s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID); s != nil {
 			s.Reset(f.ErrorCode)
-		} else {
-			c.mu.Unlock()
 		}
 	case *DataBlockedFrame:
 		// Peer is blocked at connection level; send MAX_DATA
 		c.sendFrames([]Frame{&MaxDataFrame{MaxData: uint64(c.fc.ConnMaxData())}})
 	case *StreamDataBlockedFrame:
-		// Peer stream is blocked; send WINDOW_UPDATE
+		// Peer stream is blocked; send WINDOW_UPDATE with current receive window
+		if s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID); s != nil {
+			if s.streamFC != nil {
+				newWindow := s.streamFC.GrowRecvWindow()
+				c.sendWindowUpdate(s.ID, s.RemoteID, int(newWindow))
+			}
+		}
 	}
 }
 
@@ -456,20 +484,16 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 	}
 }
 
-func (c *Connection) handleWindowUpdate(streamID uint32, f *WindowUpdateFrame) {
-	c.mu.Lock()
-	s, ok := c.streams[streamID]
-	c.mu.Unlock()
-	if ok {
+func (c *Connection) handleWindowUpdate(pkt *Packet, f *WindowUpdateFrame) {
+	s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID)
+	if s != nil {
 		s.OnWindowUpdate(int64(f.WindowSize))
 	}
 }
 
-func (c *Connection) handleResetStream(streamID uint32, f *ResetStreamFrame) {
-	c.mu.Lock()
-	s, ok := c.streams[streamID]
-	c.mu.Unlock()
-	if ok {
+func (c *Connection) handleResetStream(pkt *Packet, f *ResetStreamFrame) {
+	s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID)
+	if s != nil {
 		s.DeliverReset(f.ErrorCode)
 	}
 }

@@ -146,3 +146,14 @@ func (sfc *StreamFlowController) ResetReceived() {
 	defer sfc.mu.Unlock()
 	sfc.dataRecvd = 0
 }
+
+// GrowRecvWindow grows the receive window by the amount received since last
+// update and resets the received counter. Returns the new window size to
+// advertise to the peer via WindowUpdateFrame.
+func (sfc *StreamFlowController) GrowRecvWindow() int64 {
+	sfc.mu.Lock()
+	defer sfc.mu.Unlock()
+	sfc.recvWindow += sfc.dataRecvd
+	sfc.dataRecvd = 0
+	return sfc.recvWindow
+}
