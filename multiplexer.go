@@ -5,7 +5,14 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
+
+// earlyPacket holds a packet that arrived before its connection's SYN.
+type earlyPacket struct {
+	pkt  *Packet
+	addr net.Addr
+}
 
 // Multiplexer binds a UDP socket and routes packets by destination CID.
 type Multiplexer struct {
@@ -15,6 +22,10 @@ type Multiplexer struct {
 
 	// CID -> Connection routing
 	connections map[string]*Connection // key: hex(CID)
+
+	// Buffer for packets that arrive before the connection SYN.
+	// Keyed by destination CID string. Capped to prevent memory abuse.
+	earlyPackets map[string][]earlyPacket
 
 	// Incoming connection acceptance
 	incoming chan *Connection
@@ -27,13 +38,15 @@ type Multiplexer struct {
 // NewMultiplexer creates a new multiplexer on the given PacketConn.
 func NewMultiplexer(conn net.PacketConn, clk Clock) *Multiplexer {
 	m := &Multiplexer{
-		conn:        conn,
-		clk:         clk,
-		connections: make(map[string]*Connection),
-		incoming:    make(chan *Connection, 16),
-		closeCh:     make(chan struct{}),
+		conn:         conn,
+		clk:          clk,
+		connections:  make(map[string]*Connection),
+		earlyPackets: make(map[string][]earlyPacket),
+		incoming:     make(chan *Connection, 16),
+		closeCh:      make(chan struct{}),
 	}
 	go m.readLoop()
+	go m.idleTimeoutLoop()
 	return m
 }
 
@@ -66,8 +79,11 @@ func (m *Multiplexer) Dial(ctx context.Context, addr net.Addr) (*Connection, err
 			return err
 		})
 
+	cidKey := localCID.String()
+	c.onClose = func() { m.removeConnection(cidKey) }
+
 	m.mu.Lock()
-	m.connections[localCID.String()] = c
+	m.connections[cidKey] = c
 	m.mu.Unlock()
 
 	// Send a SYN packet to initiate the connection
@@ -87,12 +103,19 @@ func (m *Multiplexer) Close() error {
 	m.closeOnce.Do(func() {
 		close(m.closeCh)
 
+		// Collect connections and clear the map before closing them,
+		// so onClose callbacks don't deadlock trying to acquire m.mu.
 		m.mu.Lock()
+		conns := make([]*Connection, 0, len(m.connections))
 		for _, c := range m.connections {
-			c.Close()
+			conns = append(conns, c)
 		}
 		m.connections = make(map[string]*Connection)
 		m.mu.Unlock()
+
+		for _, c := range conns {
+			c.Close()
+		}
 
 		m.conn.Close()
 	})
@@ -109,6 +132,35 @@ func (m *Multiplexer) ConnectionCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.connections)
+}
+
+// removeConnection removes a connection from the routing map.
+func (m *Multiplexer) removeConnection(cidKey string) {
+	m.mu.Lock()
+	delete(m.connections, cidKey)
+	m.mu.Unlock()
+}
+
+// idleTimeoutLoop periodically checks for closed connections and removes them.
+func (m *Multiplexer) idleTimeoutLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.closeCh:
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			for cidKey, c := range m.connections {
+				select {
+				case <-c.closeCh:
+					delete(m.connections, cidKey)
+				default:
+				}
+			}
+			m.mu.Unlock()
+		}
+	}
 }
 
 func (m *Multiplexer) readLoop() {
@@ -140,10 +192,6 @@ func (m *Multiplexer) readLoop() {
 func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	pkt, err := UnmarshalPacket(data)
 	if err != nil {
-		// Try version negotiation
-		if len(data) >= 4 {
-			// Could send version negotiation response
-		}
 		return
 	}
 
@@ -170,7 +218,18 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	}
 
 	if !hasSyn {
-		return // Drop unknown non-SYN packet
+		// Buffer the packet — it may have arrived before the SYN due to
+		// UDP reordering over the internet. Cap at 32 packets per CID
+		// and 256 total CIDs to prevent memory abuse.
+		m.mu.Lock()
+		if len(m.earlyPackets) < 256 {
+			buf := m.earlyPackets[cidKey]
+			if len(buf) < 32 {
+				m.earlyPackets[cidKey] = append(buf, earlyPacket{pkt: pkt, addr: addr})
+			}
+		}
+		m.mu.Unlock()
+		return
 	}
 
 	// Create new connection for incoming
@@ -182,6 +241,7 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 			_, err := m.conn.WriteTo(data, addr)
 			return err
 		})
+	newConn.onClose = func() { m.removeConnection(cidKey) }
 	newConn.mu.Lock()
 	newConn.state = ConnStateEstablished
 	newConn.addrValidated = true // Validated by receiving a valid SYN
@@ -189,10 +249,18 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 
 	m.mu.Lock()
 	m.connections[cidKey] = newConn
+	// Grab any early-arriving packets for this CID
+	early := m.earlyPackets[cidKey]
+	delete(m.earlyPackets, cidKey)
 	m.mu.Unlock()
 
-	// Deliver the initial packet
+	// Deliver the SYN packet first
 	newConn.HandlePacket(pkt)
+
+	// Replay early packets in arrival order
+	for _, ep := range early {
+		newConn.HandlePacket(ep.pkt)
+	}
 
 	// Notify acceptor
 	select {

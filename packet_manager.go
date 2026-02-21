@@ -42,6 +42,7 @@ type PacketManager struct {
 func NewPacketManager(clock Clock, cc *CongestionController) *PacketManager {
 	return &PacketManager{
 		clock:              clock,
+		nextSeq:            0,
 		lastSentSeq:        -1,
 		sentPackets:        make(map[uint32]*SentPacket),
 		retransmitTimers:   make(map[uint32]*time.Timer),

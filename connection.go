@@ -55,8 +55,8 @@ type Connection struct {
 	pathChallenge     [8]byte
 	pathChallengeResp chan [8]byte
 
-	// Receive-side packet deduplication
-	seenPackets  map[uint32]struct{}
+	// Receive-side packet deduplication (keyed by seq<<32|size)
+	seenPackets  map[uint64]struct{}
 	highWaterSeq uint32
 
 	// Anti-amplification
@@ -66,6 +66,9 @@ type Connection struct {
 
 	// Packet sending
 	sendFunc func(data []byte, addr net.Addr) error
+
+	// Cleanup callback (set by multiplexer to remove from connection map)
+	onClose func()
 
 	// Close
 	closeOnce sync.Once
@@ -93,7 +96,7 @@ func NewConnection(
 		maxStreams:      InitialMaxStreams,
 		incomingStreams: make(chan *Stream, 16),
 		pmtud:        NewPMTUDController(),
-		seenPackets:  make(map[uint32]struct{}),
+		seenPackets:  make(map[uint64]struct{}),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
@@ -192,6 +195,10 @@ func (c *Connection) CloseWithError(code uint32, reason string) error {
 
 		c.cc.Destroy()
 		c.pm.Destroy()
+
+		if c.onClose != nil {
+			c.onClose()
+		}
 	})
 	return nil
 }
@@ -266,7 +273,32 @@ func (c *Connection) findStream(localID, remoteID uint32) *Stream {
 // --- Packet handling ---
 
 func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame) {
-	seq := c.pm.NextSequence()
+	// Determine if this packet carries data (stream frames with data/SYN/FIN).
+	// Control-only packets (ACKs, window updates, etc.) reuse the last data
+	// sequence number to avoid creating sequence gaps that break the Dart UDX
+	// receive ordering. The Dart only buffers OOO packets with stream data;
+	// pure-control packets with new sequences cause _nextExpectedSeq to stick.
+	hasData := false
+	for _, f := range frames {
+		if sf, ok := f.(*StreamFrame); ok {
+			if len(sf.Data) > 0 || sf.IsSyn || sf.IsFin {
+				hasData = true
+				break
+			}
+		}
+	}
+
+	var seq uint32
+	if hasData {
+		seq = c.pm.NextSequence()
+	} else {
+		// Control-only packets (ACKs, window updates, etc.) always use seq=0.
+		// This prevents them from consuming sequence numbers in the receiver's
+		// ordering logic. The Dart UDX receive ordering only advances
+		// _nextExpectedSeq for data-bearing packets; control packets with new
+		// sequences create gaps that stall delivery forever.
+		seq = 0
+	}
 
 	pkt := &Packet{
 		Version:             VersionCurrent,
@@ -280,13 +312,15 @@ func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame)
 
 	data := MarshalPacket(pkt)
 
-	// Track in packet manager
-	sentPkt := &SentPacket{
-		Sequence: seq,
-		Size:     len(data),
-		Frames:   frames,
+	// Only track data packets in the packet manager (control packets use reused seq)
+	if hasData {
+		sentPkt := &SentPacket{
+			Sequence: seq,
+			Size:     len(data),
+			Frames:   frames,
+		}
+		c.pm.SendPacket(sentPkt)
 	}
-	c.pm.SendPacket(sentPkt)
 	c.cc.OnPacketSent(len(data))
 
 	// Anti-amplification check
@@ -308,55 +342,62 @@ func (c *Connection) sendFrames(frames []Frame) {
 }
 
 // HandlePacket processes an incoming packet with deduplication.
-// Tracks seen packet sequences to prevent duplicate data delivery, which
-// corrupts the Noise encryption layer (chacha20poly1305 MAC failures).
+// Tracks seen packets to prevent duplicate stream data delivery,
+// which corrupts the Noise encryption layer (chacha20poly1305 MAC failures).
+//
+// The dedup key is (sequence, marshaledSize) because the Dart UDX
+// implementation sends genuinely different packets with the same sequence
+// number (e.g. connection SYN, stream SYN, and data all at seq=0).
+// Using sequence alone would wrongly suppress these distinct packets.
+// True retransmissions have the same sequence AND the same size.
 func (c *Connection) HandlePacket(pkt *Packet) {
+	marshaledData := MarshalPacket(pkt)
+	pktSize := uint32(len(marshaledData))
+
 	c.mu.Lock()
-	c.bytesReceived += int64(len(MarshalPacket(pkt))) // approximate
+	c.bytesReceived += int64(pktSize)
 
 	seq := pkt.Sequence
-
-	if _, seen := c.seenPackets[seq]; seen {
-		// Duplicate packet — still ACK (original ACK may have been lost)
-		// but do NOT deliver stream data again.
-		c.mu.Unlock()
-		// Process only ACK frames (idempotent) from duplicates
-		for _, frame := range pkt.Frames {
-			if f, ok := frame.(*AckFrame); ok {
-				c.handleAckFrame(f)
-			}
-		}
-		// Re-send ACK so sender stops retransmitting
-		if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
-			c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{&AckFrame{
-				LargestAcked:        pkt.Sequence,
-				AckDelay:            0,
-				FirstAckRangeLength: 1,
-			}})
-		}
-		return
+	// Composite key: upper 32 bits = sequence, lower 32 bits = packet size
+	dedupeKey := uint64(seq)<<32 | uint64(pktSize)
+	seen := false
+	if _, exists := c.seenPackets[dedupeKey]; exists {
+		seen = true
 	}
 
-	// Mark as seen
-	c.seenPackets[seq] = struct{}{}
-	if seq > c.highWaterSeq {
-		c.highWaterSeq = seq
-	}
-	// Prevent unbounded memory growth: trim entries far below high water mark
-	if len(c.seenPackets) > 1000 {
-		threshold := c.highWaterSeq - 500
-		for s := range c.seenPackets {
-			if s < threshold {
-				delete(c.seenPackets, s)
+	if !seen {
+		c.seenPackets[dedupeKey] = struct{}{}
+		if seq > c.highWaterSeq {
+			c.highWaterSeq = seq
+		}
+		// Prevent unbounded memory growth: trim entries far below high water mark
+		if len(c.seenPackets) > 1000 {
+			threshold := uint64(c.highWaterSeq-500) << 32
+			for k := range c.seenPackets {
+				if k < threshold {
+					delete(c.seenPackets, k)
+				}
 			}
 		}
 	}
 	c.mu.Unlock()
 
-	// Process all frames and send ACK
+	// Process all frames. For true duplicates (same seq+size), skip StreamFrame
+	// data delivery to prevent corrupting the ordered byte stream, but always
+	// process control frames (ACK, WindowUpdate, Ping, etc.).
 	for _, frame := range pkt.Frames {
+		if seen {
+			if sf, ok := frame.(*StreamFrame); ok {
+				if len(sf.Data) > 0 {
+					continue // Skip duplicate stream data
+				}
+				// Still process SYN/FIN flags even on duplicate seq
+			}
+		}
 		c.handleFrame(pkt, frame)
 	}
+
+	// Send ACK
 	if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
 		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{&AckFrame{
 			LargestAcked:        pkt.Sequence,
@@ -455,7 +496,6 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 		select {
 		case c.incomingStreams <- s:
 		default:
-			// Channel full, drop
 		}
 	} else {
 		c.mu.Unlock()
