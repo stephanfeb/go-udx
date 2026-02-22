@@ -61,6 +61,10 @@ type Connection struct {
 	seenPackets  map[uint64]struct{}
 	highWaterSeq uint32
 
+	// Receive-side SACK tracking: records sequence numbers of received
+	// data-bearing packets so ACKs can include selective acknowledgment ranges.
+	recvdDataSeqs map[uint32]struct{}
+
 	// Anti-amplification
 	bytesSent     int64
 	bytesReceived int64
@@ -98,7 +102,8 @@ func NewConnection(
 		maxStreams:      InitialMaxStreams,
 		incomingStreams: make(chan *Stream, 16),
 		pmtud:        NewPMTUDController(),
-		seenPackets:  make(map[uint64]struct{}),
+		seenPackets:   make(map[uint64]struct{}),
+		recvdDataSeqs: make(map[uint32]struct{}),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
@@ -405,14 +410,116 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		c.handleFrame(pkt, frame)
 	}
 
-	// Send ACK
+	// Send ACK with SACK ranges so the remote sender can identify lost packets
 	if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
-		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{&AckFrame{
-			LargestAcked:        pkt.Sequence,
+		if seq > 0 {
+			c.mu.Lock()
+			c.recvdDataSeqs[seq] = struct{}{}
+			c.mu.Unlock()
+		}
+		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{c.buildAckFrame(seq)})
+	}
+}
+
+// buildAckFrame constructs an AckFrame with SACK ranges from received data
+// packet sequences. This allows the remote sender to identify exactly which
+// packets were lost and selectively retransmit them.
+func (c *Connection) buildAckFrame(latestSeq uint32) *AckFrame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// No data packets received yet — send simple ACK for the current packet
+	if len(c.recvdDataSeqs) == 0 || latestSeq == 0 {
+		return &AckFrame{
+			LargestAcked:        latestSeq,
 			AckDelay:            0,
 			FirstAckRangeLength: 1,
-		}})
+		}
 	}
+
+	// Find the largest received sequence
+	largest := latestSeq
+	for seq := range c.recvdDataSeqs {
+		if seq > largest {
+			largest = seq
+		}
+	}
+
+	// Build first range: count consecutive seqs downward from largest
+	firstRangeLen := uint32(0)
+	cursor := largest
+	for {
+		if _, ok := c.recvdDataSeqs[cursor]; ok {
+			firstRangeLen++
+			if cursor == 0 {
+				break
+			}
+			cursor--
+		} else {
+			break
+		}
+	}
+
+	frame := &AckFrame{
+		LargestAcked:        largest,
+		AckDelay:            0,
+		FirstAckRangeLength: firstRangeLen,
+	}
+
+	// Build additional SACK ranges (max 5).
+	// cursor is now the first missing seq below the first range.
+	for len(frame.AckRanges) < 5 && cursor > 0 {
+		// Count gap (consecutive missing seqs)
+		gap := uint8(0)
+		for cursor > 0 {
+			if _, ok := c.recvdDataSeqs[cursor]; !ok {
+				gap++
+				cursor--
+				if gap == 255 {
+					break
+				}
+			} else {
+				break
+			}
+		}
+		if gap == 0 {
+			break
+		}
+
+		// Count acked range (consecutive received seqs)
+		rangeLen := uint32(0)
+		for {
+			if _, ok := c.recvdDataSeqs[cursor]; ok {
+				rangeLen++
+				if cursor == 0 {
+					break
+				}
+				cursor--
+			} else {
+				break
+			}
+		}
+		if rangeLen == 0 {
+			break
+		}
+
+		frame.AckRanges = append(frame.AckRanges, AckRange{
+			Gap:            gap,
+			AckRangeLength: rangeLen,
+		})
+	}
+
+	// Prune old entries to bound memory
+	if len(c.recvdDataSeqs) > 500 {
+		threshold := largest - 500
+		for seq := range c.recvdDataSeqs {
+			if seq < threshold {
+				delete(c.recvdDataSeqs, seq)
+			}
+		}
+	}
+
+	return frame
 }
 
 func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
