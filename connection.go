@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -167,6 +169,12 @@ func (c *Connection) Close() error {
 // CloseWithError closes the connection with an error code and reason.
 func (c *Connection) CloseWithError(code uint32, reason string) error {
 	c.closeOnce.Do(func() {
+		// Capture stack trace for diagnostic logging
+		buf := make([]byte, 4096)
+		n := runtime.Stack(buf, false)
+		log.Printf("[UDX-DIAG] CloseWithError code=%d reason=%q localCID=%s remoteCID=%s remoteAddr=%v\n%s",
+			code, reason, c.localCID, c.remoteCID, c.remoteAddr, string(buf[:n]))
+
 		c.mu.Lock()
 		c.state = ConnStateClosing
 		c.mu.Unlock()

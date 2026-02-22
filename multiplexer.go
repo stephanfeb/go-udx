@@ -3,6 +3,7 @@ package udx
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -101,6 +102,7 @@ func (m *Multiplexer) Dial(ctx context.Context, addr net.Addr) (*Connection, err
 // Close shuts down the multiplexer and all connections.
 func (m *Multiplexer) Close() error {
 	m.closeOnce.Do(func() {
+		log.Printf("[UDX-DIAG] Multiplexer.Close() called, %d active connections", len(m.connections))
 		close(m.closeCh)
 
 		// Collect connections and clear the map before closing them,
@@ -263,8 +265,11 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	}
 
 	// Notify acceptor
+	log.Printf("[UDX-DIAG] New incoming connection localCID=%s remoteCID=%s remoteAddr=%v earlyPackets=%d",
+		localCID, remoteCID, addr, len(early))
 	select {
 	case m.incoming <- newConn:
 	default:
+		log.Printf("[UDX-DIAG] WARNING: incoming channel full, connection dropped localCID=%s", localCID)
 	}
 }

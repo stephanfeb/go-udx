@@ -3,6 +3,7 @@ package udx
 import (
 	"errors"
 	"io"
+	"log"
 	"sync"
 	"time"
 )
@@ -46,12 +47,13 @@ type Stream struct {
 	writeDeadline time.Time
 
 	// Receive side
-	recvBuf       []byte         // ordered data ready for reading
-	recvOOO       map[uint32][]byte // out-of-order buffer: seq -> data
-	nextExpectSeq uint32
-	recvCond      *sync.Cond
-	readDeadline  time.Time
-	finReceived   bool
+	recvBuf        []byte            // ordered data ready for reading
+	recvOOO        map[uint32][]byte // out-of-order buffer: seq -> data
+	nextExpectSeq  uint32
+	recvSeqInit    bool // true after first DeliverData sets nextExpectSeq
+	recvCond       *sync.Cond
+	readDeadline   time.Time
+	finReceived    bool
 
 	// Flow control
 	streamFC *StreamFlowController
@@ -259,17 +261,57 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // --- Receive-side methods called by Connection ---
 
-// DeliverData delivers data to the stream's receive buffer.
-// Deduplication is handled at the connection level (Connection.HandlePacket),
-// so data arriving here is already guaranteed to be non-duplicate and in order.
+// DeliverData delivers data to the stream's receive buffer in sequence order.
+// UDP can deliver packets out of order over real networks. If data arrives
+// out of sequence, it is buffered in recvOOO and delivered once the gap is
+// filled. This is critical for the Noise encryption layer, which uses a
+// sequential nonce counter — out-of-order bytes cause MAC failures.
 func (s *Stream) DeliverData(seq uint32, data []byte) {
 	s.mu.Lock()
 
-	s.recvBuf = append(s.recvBuf, data...)
+	// Initialize expected sequence on first data delivery
+	if !s.recvSeqInit {
+		s.nextExpectSeq = seq
+		s.recvSeqInit = true
+	}
+
+	dataLen := len(data)
+
+	if seq == s.nextExpectSeq {
+		// In-order: deliver directly
+		s.recvBuf = append(s.recvBuf, data...)
+		s.nextExpectSeq++
+
+		// Flush any contiguous OOO entries
+		for {
+			if oooData, ok := s.recvOOO[s.nextExpectSeq]; ok {
+				s.recvBuf = append(s.recvBuf, oooData...)
+				delete(s.recvOOO, s.nextExpectSeq)
+				s.nextExpectSeq++
+			} else {
+				break
+			}
+		}
+	} else if seq > s.nextExpectSeq {
+		// Out-of-order: buffer for later delivery
+		if _, exists := s.recvOOO[seq]; !exists {
+			log.Printf("[UDX-DIAG] Stream %d: OOO packet seq=%d (expected=%d), buffering %d bytes (%d OOO buffered)",
+				s.ID, seq, s.nextExpectSeq, dataLen, len(s.recvOOO)+1)
+			buf := make([]byte, dataLen)
+			copy(buf, data)
+			s.recvOOO[seq] = buf
+		}
+	} else {
+		// seq < nextExpectSeq: duplicate or late arrival, drop
+		log.Printf("[UDX-DIAG] Stream %d: late/duplicate seq=%d (expected=%d), dropping %d bytes",
+			s.ID, seq, s.nextExpectSeq, dataLen)
+		s.mu.Unlock()
+		return
+	}
 
 	var sendUpdate bool
 	if s.streamFC != nil {
-		sendUpdate = s.streamFC.OnDataReceived(len(data))
+		sendUpdate = s.streamFC.OnDataReceived(dataLen)
 	}
 
 	conn := s.conn
