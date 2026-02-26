@@ -7,11 +7,15 @@ import (
 
 // SentPacket tracks a packet that was sent and awaits acknowledgment.
 type SentPacket struct {
-	Sequence uint32
-	SentTime time.Time
-	Size     int
-	IsAcked  bool
-	Frames   []Frame
+	Sequence            uint32
+	SentTime            time.Time
+	Size                int
+	IsAcked             bool
+	Frames              []Frame
+	DestinationStreamID uint32
+	SourceStreamID      uint32
+	RetransmitCount     int
+	LastRetransmit      time.Time
 }
 
 // PacketManager tracks sent packets, handles ACK processing, and schedules retransmissions.
@@ -145,6 +149,50 @@ func (pm *PacketManager) GetPacket(seq uint32) *SentPacket {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	return pm.sentPackets[seq]
+}
+
+// DetectLostPackets examines SACK gaps in an AckFrame and returns sequence
+// numbers of packets that are inferred lost (present in sentPackets but
+// falling within a gap between acknowledged ranges). Packets that were
+// already retransmitted within the last RTO are skipped to prevent storms.
+func (pm *PacketManager) DetectLostPackets(frame *AckFrame) []uint32 {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if len(frame.AckRanges) == 0 {
+		return nil
+	}
+
+	rto := pm.retransmitTimeout()
+	now := pm.clock.Now()
+	var lost []uint32
+
+	// Walk through the gaps between ACK ranges.
+	// After the first range, cursor points to the first sequence below it.
+	cursor := int64(frame.LargestAcked) - int64(frame.FirstAckRangeLength)
+
+	for _, r := range frame.AckRanges {
+		// The gap contains sequences that were NOT acknowledged.
+		for g := uint8(0); g < r.Gap; g++ {
+			if cursor < 0 {
+				break
+			}
+			seq := uint32(cursor)
+			if pkt, ok := pm.sentPackets[seq]; ok {
+				// Skip if already retransmitted recently.
+				if pkt.RetransmitCount > 0 && now.Sub(pkt.LastRetransmit) < rto {
+					cursor--
+					continue
+				}
+				lost = append(lost, seq)
+			}
+			cursor--
+		}
+		// Skip over the acked range.
+		cursor -= int64(r.AckRangeLength)
+	}
+
+	return lost
 }
 
 // PendingCount returns the number of unacked sent packets.

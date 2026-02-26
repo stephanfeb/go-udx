@@ -118,6 +118,12 @@ func NewConnection(
 		return -1
 	})
 	c.pm = NewPacketManager(clk, c.cc)
+	c.pm.OnRetransmit = func(pkt *SentPacket) {
+		c.retransmitPacket(pkt)
+	}
+	c.pm.OnPacketPermanentLoss = func(pkt *SentPacket) {
+		c.cc.OnPacketLost(pkt.Size)
+	}
 	c.fc = NewFlowController(int64(InitialMaxData), int64(InitialMaxData))
 
 	// Odd stream IDs for initiator, even for responder
@@ -328,9 +334,11 @@ func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame)
 	// Only track data packets in the packet manager (control packets use reused seq)
 	if hasData {
 		sentPkt := &SentPacket{
-			Sequence: seq,
-			Size:     len(data),
-			Frames:   frames,
+			Sequence:            seq,
+			Size:                len(data),
+			Frames:              frames,
+			DestinationStreamID: dstStreamID,
+			SourceStreamID:      srcStreamID,
 		}
 		c.pm.SendPacket(sentPkt)
 	}
@@ -352,6 +360,35 @@ func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame)
 
 func (c *Connection) sendFrames(frames []Frame) {
 	c.sendPacket(0, 0, frames)
+}
+
+// retransmitPacket re-sends a lost packet using its ORIGINAL sequence number.
+// This bypasses sendPacket() to avoid allocating a new sequence (which would
+// break the receiver's ordering and corrupt the Noise nonce chain).
+func (c *Connection) retransmitPacket(pkt *SentPacket) {
+	pkt.RetransmitCount++
+	pkt.LastRetransmit = c.clk.Now()
+
+	rePkt := &Packet{
+		Version:             VersionCurrent,
+		DestinationCID:      c.remoteCID,
+		SourceCID:           c.localCID,
+		Sequence:            pkt.Sequence, // original sequence number
+		DestinationStreamID: pkt.DestinationStreamID,
+		SourceStreamID:      pkt.SourceStreamID,
+		Frames:              pkt.Frames,
+	}
+
+	data := MarshalPacket(rePkt)
+	c.cc.OnPacketSent(len(data))
+
+	c.mu.Lock()
+	c.bytesSent += int64(len(data))
+	c.mu.Unlock()
+
+	if c.sendFunc != nil {
+		c.sendFunc(data, c.remoteAddr)
+	}
 }
 
 // HandlePacket processes an incoming packet with deduplication.
@@ -635,6 +672,14 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 		if pkt := c.pm.GetPacket(seq); pkt != nil {
 			c.cc.OnPacketAcked(pkt.Size, pkt.SentTime, time.Duration(f.AckDelay)*time.Millisecond,
 				true, int(f.LargestAcked))
+		}
+	}
+
+	// SACK-based loss detection: retransmit packets that fall within gaps.
+	lost := c.pm.DetectLostPackets(f)
+	for _, seq := range lost {
+		if pkt := c.pm.GetPacket(seq); pkt != nil {
+			c.retransmitPacket(pkt)
 		}
 	}
 }

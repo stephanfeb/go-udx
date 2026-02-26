@@ -118,6 +118,101 @@ func TestPacketManager_GetPacket(t *testing.T) {
 	}
 }
 
+func TestPacketManager_DetectLostPackets(t *testing.T) {
+	pm, _, _ := newTestPM(t)
+	defer pm.Destroy()
+
+	// Send packets 0-9
+	for i := 0; i < 10; i++ {
+		seq := pm.NextSequence()
+		pm.SendPacket(&SentPacket{Sequence: seq, Size: 100, Frames: []Frame{&PingFrame{}}})
+	}
+
+	// ACK frame acknowledges {5,6,7,8,9} and {0,1,2} with gap at {3,4}.
+	// First range: 9 down to 5 (length 5)
+	// Gap: 2 (packets 4,3 missing)
+	// Second range: 2,1,0 (length 3)
+	ackFrame := &AckFrame{
+		LargestAcked:        9,
+		AckDelay:            0,
+		FirstAckRangeLength: 5, // acks 9,8,7,6,5
+		AckRanges: []AckRange{
+			{Gap: 2, AckRangeLength: 3}, // skip 4,3 then ack 2,1,0
+		},
+	}
+
+	lost := pm.DetectLostPackets(ackFrame)
+	if len(lost) != 2 {
+		t.Fatalf("lost count: got %d, want 2", len(lost))
+	}
+
+	// Should detect packets 4 and 3 as lost.
+	lostMap := map[uint32]bool{}
+	for _, seq := range lost {
+		lostMap[seq] = true
+	}
+	if !lostMap[3] || !lostMap[4] {
+		t.Fatalf("expected lost packets 3,4 but got %v", lost)
+	}
+}
+
+func TestPacketManager_DetectLostPackets_SkipsRecentRetransmit(t *testing.T) {
+	pm, _, clk := newTestPM(t)
+	defer pm.Destroy()
+
+	// Send packets 0-4
+	for i := 0; i < 5; i++ {
+		seq := pm.NextSequence()
+		pm.SendPacket(&SentPacket{Sequence: seq, Size: 100, Frames: []Frame{&PingFrame{}}})
+	}
+
+	// Mark packet 2 as recently retransmitted.
+	pkt := pm.GetPacket(2)
+	pkt.RetransmitCount = 1
+	pkt.LastRetransmit = clk.Now()
+
+	// ACK frame: acks {3,4}, gap at {2}, acks {0,1}
+	ackFrame := &AckFrame{
+		LargestAcked:        4,
+		AckDelay:            0,
+		FirstAckRangeLength: 2, // acks 4,3
+		AckRanges: []AckRange{
+			{Gap: 1, AckRangeLength: 2}, // skip 2, ack 1,0
+		},
+	}
+
+	lost := pm.DetectLostPackets(ackFrame)
+	if len(lost) != 0 {
+		t.Fatalf("expected no lost packets (recently retransmitted), got %v", lost)
+	}
+
+	// Advance time past RTO, should now detect it.
+	clk.Advance(6 * time.Second)
+	lost = pm.DetectLostPackets(ackFrame)
+	if len(lost) != 1 || lost[0] != 2 {
+		t.Fatalf("expected lost [2] after RTO, got %v", lost)
+	}
+}
+
+func TestPacketManager_DetectLostPackets_NoRanges(t *testing.T) {
+	pm, _, _ := newTestPM(t)
+	defer pm.Destroy()
+
+	pm.SendPacket(&SentPacket{Sequence: 0, Size: 100, Frames: []Frame{&PingFrame{}}})
+
+	// Simple ACK with no additional ranges — no gaps.
+	ackFrame := &AckFrame{
+		LargestAcked:        0,
+		AckDelay:            0,
+		FirstAckRangeLength: 1,
+	}
+
+	lost := pm.DetectLostPackets(ackFrame)
+	if len(lost) != 0 {
+		t.Fatalf("expected no lost packets, got %v", lost)
+	}
+}
+
 func TestPacketManager_Destroy(t *testing.T) {
 	pm, _, _ := newTestPM(t)
 
