@@ -34,6 +34,7 @@ type Multiplexer struct {
 	// Lifecycle
 	closeOnce sync.Once
 	closeCh   chan struct{}
+	wg        sync.WaitGroup
 }
 
 // NewMultiplexer creates a new multiplexer on the given PacketConn.
@@ -46,8 +47,9 @@ func NewMultiplexer(conn net.PacketConn, clk Clock) *Multiplexer {
 		incoming:     make(chan *Connection, 16),
 		closeCh:      make(chan struct{}),
 	}
-	go m.readLoop()
-	go m.idleTimeoutLoop()
+	m.wg.Add(2)
+	go func() { defer m.wg.Done(); m.readLoop() }()
+	go func() { defer m.wg.Done(); m.idleTimeoutLoop() }()
 	return m
 }
 
@@ -102,7 +104,6 @@ func (m *Multiplexer) Dial(ctx context.Context, addr net.Addr) (*Connection, err
 // Close shuts down the multiplexer and all connections.
 func (m *Multiplexer) Close() error {
 	m.closeOnce.Do(func() {
-		log.Printf("[UDX-DIAG] Multiplexer.Close() called, %d active connections", len(m.connections))
 		close(m.closeCh)
 
 		// Collect connections and clear the map before closing them,
@@ -121,6 +122,7 @@ func (m *Multiplexer) Close() error {
 
 		m.conn.Close()
 	})
+	m.wg.Wait()
 	return nil
 }
 
@@ -265,11 +267,9 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	}
 
 	// Notify acceptor
-	log.Printf("[UDX-DIAG] New incoming connection localCID=%s remoteCID=%s remoteAddr=%v earlyPackets=%d",
-		localCID, remoteCID, addr, len(early))
 	select {
 	case m.incoming <- newConn:
 	default:
-		log.Printf("[UDX-DIAG] WARNING: incoming channel full, connection dropped localCID=%s", localCID)
+		log.Printf("[UDX] WARNING: incoming channel full, connection dropped localCID=%s", localCID)
 	}
 }

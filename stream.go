@@ -3,7 +3,6 @@ package udx
 import (
 	"errors"
 	"io"
-	"log"
 	"sync"
 	"time"
 )
@@ -295,16 +294,12 @@ func (s *Stream) DeliverData(seq uint32, data []byte) {
 	} else if seq > s.nextExpectSeq {
 		// Out-of-order: buffer for later delivery
 		if _, exists := s.recvOOO[seq]; !exists {
-			log.Printf("[UDX-DIAG] Stream %d: OOO packet seq=%d (expected=%d), buffering %d bytes (%d OOO buffered)",
-				s.ID, seq, s.nextExpectSeq, dataLen, len(s.recvOOO)+1)
 			buf := make([]byte, dataLen)
 			copy(buf, data)
 			s.recvOOO[seq] = buf
 		}
 	} else {
 		// seq < nextExpectSeq: duplicate or late arrival, drop
-		log.Printf("[UDX-DIAG] Stream %d: late/duplicate seq=%d (expected=%d), dropping %d bytes",
-			s.ID, seq, s.nextExpectSeq, dataLen)
 		s.mu.Unlock()
 		return
 	}
