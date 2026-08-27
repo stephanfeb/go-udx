@@ -1,8 +1,10 @@
 /// Bulk-transfer Dart peer for go-udx interop tests.
 ///
 /// Modes:
-///   send  <port> <bytes>          connect to a Go server and upload <bytes>
-///   recv  <port> <bytes>          connect to a Go server and download <bytes>
+///   send      <port> <bytes>      connect to a Go server and upload <bytes>
+///   recv      <port> <bytes>      connect to a Go server and download <bytes>
+///   recvslow  <port> <ms>         download while deliberately reading slowly,
+///                                 for <ms> milliseconds, then report consumed
 ///
 /// Writes progress and a final "RESULT <bytes>" line to stderr so the Go side
 /// can assert on how much actually crossed. Exits non-zero on failure.
@@ -86,6 +88,22 @@ Future<void> main(List<String> args) async {
         stderr.writeln('CORRUPT');
         exitCode0 = 1;
       }
+    } else if (mode == 'recvslow') {
+      // Read deliberately slowly. Under consumption-anchored flow control the
+      // sender must stall rather than push its whole payload into our buffer.
+      // totalBytes is reinterpreted as a duration in milliseconds here.
+      var got = 0;
+      late StreamSubscription<Uint8List> sub;
+      sub = stream.data.listen((chunk) {
+        got += chunk.length;
+        // Pausing propagates back through the mapped stream to the controller,
+        // so nothing further is counted as consumed while we are asleep.
+        sub.pause(Future.delayed(const Duration(milliseconds: 25)));
+      });
+      await Future.delayed(Duration(milliseconds: totalBytes));
+      await sub.cancel();
+      stderr.writeln('RESULT $got');
+      stderr.writeln('WINDOW ${stream.receiveWindow}');
     } else {
       stderr.writeln('unknown mode: $mode');
       exitCode0 = 2;

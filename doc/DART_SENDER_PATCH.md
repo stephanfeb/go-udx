@@ -1,4 +1,4 @@
-# Patch for dart-udx: honour the advertised stream offset
+# Patch for dart-udx: absolute-offset stream flow control
 
 **Status: APPLIED and verified** against `dart-udx@5291cdb` (working tree, not
 committed). Written up here because `go-udx`'s interop suite is what
@@ -12,7 +12,7 @@ Result:
 | Advertised window at that point | 524,288 B | 524,288 B |
 | Invariant `buffered <= window` | violated 3.9x | holds |
 
-`go-udx` interop 6/6 pass. `dart-udx` 108 pass / 2 skipped / 0 fail.
+`go-udx` interop 7/7 pass. `dart-udx` 108 pass / 2 skipped / 0 fail.
 
 **Proves it:** `interop/bulk_interop_test.go` → `TestBulk_DartToGoSlowConsumer`.
 That test fails today and goes green when this patch lands.
@@ -169,21 +169,50 @@ update lands within one window of the current limit. A single 4GB leap is
 genuinely ambiguous and is correctly rejected, so a test that walks to the
 boundary must step there rather than jump.
 
-## Open: dart-udx's receiver has no consumption back-pressure
+## Fixed: dart-udx's receiver now applies consumption back-pressure
 
-Not part of this patch, found while testing it.
+Found while testing the sender patch, fixed separately in the same working tree.
 
-`_deliverDataInternal` (`stream.dart:228`) advertises on bytes **received**, not
-bytes consumed by the application, so a Dart receiver keeps granting credit
-whether or not anyone is reading. A Go -> Dart transfer against a slow Dart
-reader therefore has no stream-level back-pressure and Dart's buffer can grow
-without bound. `go-udx` anchors its own advertisement to consumption, which is
-why the Dart -> Go direction is now bounded.
+`_deliverDataInternal` advertised on bytes **received**, so the receiver kept
+granting credit whether or not the application was reading. A Go -> Dart
+transfer against a slow Dart reader had no stream-level back-pressure at all and
+Dart's buffer could grow without bound — the mirror image of the sender bug.
 
-This is the mirror image of the sender bug just fixed and wants the same
-treatment: advertise `bytesConsumed + window` rather than
-`initialWindow + bytesReceived`. It is a larger change because Dart's receive
-path hands data to a `StreamController`, so "consumed" needs defining.
+The receiver is now anchored to consumption, matching go-udx: it advertises
+`_bytesConsumed + _receiveWindow` as an absolute offset, triggered when the
+peer's remaining credit falls below half the window, with the window doubling
+per update up to 4MB.
+
+Defining "consumed" against Dart's `StreamController` turned out to be the
+straightforward part. The `data` getter now returns a mapped view of the
+controller's stream that counts each chunk as it is delivered to the subscriber:
+
+```dart
+Stream<Uint8List> get data => _consumedData ??=
+    _dataController.stream.map((chunk) {
+      _onDataConsumed(chunk.length);
+      return chunk;
+    });
+```
+
+If nobody is listening, or the subscription is paused, events sit in the
+controller, nothing is counted, the offset stops advancing and the sender
+stalls. Pausing propagates back through `map` to the controller, so a slow
+reader throttles the sender rather than buffering behind it. The view is cached
+because `_dataController` is single-subscription.
+
+Measured with `TestBulk_GoToDartSlowConsumer`, a Go sender pushing 16MB at a
+Dart reader that sleeps 25ms between chunks:
+
+| | Before | After |
+|---|---|---|
+| Bytes Go pushed | 16,777,216 (all of it) | 361,980 |
+| Bytes Dart consumed | 143,740 | 151,972 |
+| Dart's window | grew to 16,841,928 | held at 262,144 |
+
+`setWindow` now sets a window *size* rather than an offset, and cannot revoke
+credit already granted: it advertises `bytesConsumed + newSize`, and the peer
+applies offsets monotonically.
 
 ## Naming, optional but recommended
 

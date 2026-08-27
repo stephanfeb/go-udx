@@ -282,3 +282,64 @@ func TestBulk_DartToGoSlowConsumer(t *testing.T) {
 			buffered, window, float64(buffered)/float64(window))
 	}
 }
+
+// TestBulk_GoToDartSlowConsumer is the mirror of TestBulk_DartToGoSlowConsumer:
+// it checks that a slow *Dart* reader applies back-pressure to a *Go* sender.
+//
+// dart-udx used to advertise on bytes received rather than bytes consumed, so
+// it granted credit whether or not the application was reading. There was no
+// stream-level back-pressure in this direction at all and Dart's buffer could
+// grow without bound. Its receiver is now anchored to consumption, matching
+// go-udx, so a Go sender must stall once it fills the advertised offset.
+func TestBulk_GoToDartSlowConsumer(t *testing.T) {
+	requireDartPeer(t)
+
+	const readMillis = 3000
+	const payload = 16 << 20 // far more than any window, so the stall is the only outcome
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	mux, port, streams := goServer(t, ctx)
+	defer mux.Close()
+
+	// The peer reinterprets the third argument as a read duration in ms.
+	peer := startDartPeer(t, ctx, "recvslow", port, readMillis)
+	s := acceptOrFail(t, streams)
+
+	// Push hard. The write is expected NOT to finish.
+	writeDone := make(chan int, 1)
+	go func() {
+		s.SetWriteDeadline(time.Now().Add(time.Duration(readMillis) * time.Millisecond))
+		n, _ := s.Write(make([]byte, payload))
+		writeDone <- n
+	}()
+
+	var written int
+	select {
+	case written = <-writeDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Go writer neither completed nor hit its deadline")
+	}
+
+	res := <-peer
+	t.Logf("dart peer:\n%s", res.log)
+	t.Logf("Go wrote %d bytes; slow Dart reader consumed %d", written, res.bytes)
+
+	if res.bytes <= 0 {
+		t.Fatalf("dart peer consumed nothing (%d); test setup is wrong", res.bytes)
+	}
+	if written >= payload {
+		t.Fatalf("Go pushed all %d bytes past a Dart reader that consumed only %d; "+
+			"the Dart receiver is granting credit on receipt rather than consumption",
+			payload, res.bytes)
+	}
+
+	// A compliant receiver grants at most one window beyond what it consumed.
+	// Dart's window auto-tunes to at most 4MB, so allow two of those.
+	const bound = 2 * (4 << 20)
+	if ahead := written - res.bytes; ahead > bound {
+		t.Fatalf("Go ran %d bytes ahead of what the Dart reader consumed (bound %d): "+
+			"the Dart receiver is not applying back-pressure", ahead, bound)
+	}
+}
