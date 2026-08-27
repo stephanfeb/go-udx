@@ -1,0 +1,20 @@
+# Measurement harness for the go-udx congestion controller under simulated
+# network conditions. Both peers run inside this container over loopback, with
+# netem applied to lo, so delay/loss/reordering are controlled and repeatable.
+#
+# Unlike interop/Dockerfile this needs only go-udx — no Dart, no libp2p — because
+# it measures the transport against itself rather than testing interop.
+FROM golang:1.24-bookworm
+
+RUN apt-get update && apt-get install -y iproute2 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build/go-udx
+COPY . /build/go-udx/
+
+# Compile the test binary once so tc timing is not polluted by build time.
+RUN go test -c -o /udx.test .
+
+COPY interop/netem-run.sh /netem-run.sh
+RUN chmod +x /netem-run.sh
+
+ENTRYPOINT ["/netem-run.sh"]
