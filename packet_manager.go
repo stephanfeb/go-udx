@@ -165,6 +165,20 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 	return acked
 }
 
+// MarkRetransmitted records an attempt to re-send a packet.
+//
+// The counters live on SentPacket but DetectLostPackets reads them under pm.mu
+// to decide whether a packet was retransmitted recently enough to skip, so they
+// have to be written under it too. They used to be incremented directly by the
+// connection's retransmit path, off-lock, which raced with SACK-driven loss
+// detection whenever a retransmit timer fired while an ACK was being processed.
+func (pm *PacketManager) MarkRetransmitted(pkt *SentPacket) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pkt.RetransmitCount++
+	pkt.LastRetransmit = pm.clock.Now()
+}
+
 // GetPacket returns a sent packet by sequence number.
 func (pm *PacketManager) GetPacket(seq uint32) *SentPacket {
 	pm.mu.Lock()

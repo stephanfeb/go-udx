@@ -449,8 +449,7 @@ func (c *Connection) sendFrames(frames []Frame) {
 // This bypasses sendPacket() to avoid allocating a new sequence (which would
 // break the receiver's ordering and corrupt the Noise nonce chain).
 func (c *Connection) retransmitPacket(pkt *SentPacket) {
-	pkt.RetransmitCount++
-	pkt.LastRetransmit = c.clk.Now()
+	c.pm.MarkRetransmitted(pkt)
 
 	rePkt := &Packet{
 		Version:             VersionCurrent,
