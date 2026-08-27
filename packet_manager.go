@@ -86,6 +86,33 @@ func (pm *PacketManager) retransmitTimeout() time.Duration {
 	return time.Duration(rtoMs) * time.Millisecond
 }
 
+// retransmitBackoff returns how long to wait before the given attempt number
+// (1-based), backing off exponentially from the current RTO up to a ceiling.
+//
+// The ceiling never falls below the RTO itself. Capping below the round trip
+// would retransmit before the peer could possibly have answered, turning a slow
+// path into a flood of duplicates — so on a high-RTT link the RTO wins and the
+// backoff simply stops growing.
+func (pm *PacketManager) retransmitBackoff(attempt int) time.Duration {
+	rto := pm.retransmitTimeout()
+
+	ceiling := MaxRetransmitBackoff
+	if ceiling < rto {
+		ceiling = rto
+	}
+
+	backoff := ceiling
+	if shift := attempt - 1; shift < 32 {
+		if scaled := rto * time.Duration(1<<shift); scaled < ceiling {
+			backoff = scaled
+		}
+	}
+	if backoff < MinRetransmitTimeout {
+		backoff = MinRetransmitTimeout
+	}
+	return backoff
+}
+
 // SendPacket registers a sent packet for tracking and retransmission.
 func (pm *PacketManager) SendPacket(pkt *SentPacket) {
 	pm.mu.Lock()
@@ -264,15 +291,7 @@ func (pm *PacketManager) scheduleRetransmission(pkt *SentPacket) {
 				pm.OnRetransmit(p)
 			}
 
-			// Exponential backoff
-			rto := pm.retransmitTimeout()
-			backoff := rto * time.Duration(1<<(retryCount-1))
-			if backoff < MinRetransmitTimeout {
-				backoff = MinRetransmitTimeout
-			}
-			if backoff > MaxRetransmitTimeout {
-				backoff = MaxRetransmitTimeout
-			}
+			backoff := pm.retransmitBackoff(retryCount)
 
 			pm.mu.Lock()
 			pm.retransmitTimers[seq] = pm.clock.AfterFunc(backoff, retransmit)
