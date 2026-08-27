@@ -132,6 +132,7 @@ func NewConnection(
 	}
 	c.pm.OnPacketPermanentLoss = func(pkt *SentPacket) {
 		c.cc.OnPacketLost(pkt.Size)
+		c.abandonStream(pkt)
 	}
 	c.fc = NewFlowController(int64(InitialMaxData), int64(InitialMaxData))
 
@@ -332,6 +333,31 @@ func (c *Connection) awaitSendCredit(size int, deadline time.Time) bool {
 }
 
 func (c *Connection) clock() Clock { return c.clk }
+
+// abandonStream tears down the stream a permanently-lost packet belonged to.
+//
+// Retransmission gives up eventually, and a reliable ordered stream cannot
+// survive that: the bytes in the abandoned packet are a hole in the middle of
+// the byte stream, so the peer's reader waits on a sequence that will never be
+// offered again. Previously the packet was simply dropped from the tracking
+// table and the stream left in place, which meant an application saw the
+// connection stop rather than an error — the same silent stall that showed up
+// downstream as 40s yamux keepalive timeouts instead of an actionable failure.
+//
+// Reset is the honest outcome. Stream.Reset both wakes the local reader and
+// writer with ErrStreamReset and sends RESET_STREAM so the peer's side fails
+// too; it is idempotent, so losing several packets on one stream resets it once.
+//
+// Only data-bearing packets are tracked for retransmission, so a lost packet
+// always belongs to a stream. SourceStreamID is our local ID and
+// DestinationStreamID the peer's, matching how sendPacket recorded them.
+func (c *Connection) abandonStream(pkt *SentPacket) {
+	s := c.findStream(pkt.SourceStreamID, pkt.DestinationStreamID)
+	if s == nil {
+		return
+	}
+	s.Reset(ErrorInternalError)
+}
 
 // findStream looks up a stream by local ID first, then falls back to searching
 // by remote ID. This is needed because the Dart UDX transport assigns random

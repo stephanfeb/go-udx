@@ -132,8 +132,29 @@ const (
 )
 
 // Retransmission
+//
+// The budget is sized against MaxIdleTimeout: on a healthy path a packet runs
+// out of attempts at roughly 28s, just inside 30s. On a slow path the backoff
+// tracks the RTO instead of the cap and the budget stretches with it, which is
+// the right trade — a long round trip earns more time, not fewer tries.
+//
+// It used to be 10 attempts with the backoff capped at 30s, which spent them
+// over ~111s. Most of that went on waiting rather than trying: the last two
+// attempts alone accounted for 60s. Capping the backoff buys 16 attempts in a
+// quarter of the time.
+//
+// Note that MaxIdleTimeout is declared but not currently enforced anywhere, so
+// running out of attempts is the ONLY thing that surfaces an unrecoverable
+// packet. That is why exhausting them resets the stream (Connection.
+// abandonStream) rather than silently dropping the packet: nothing else would
+// ever tell the application.
 const (
-	MaxRetransmitRetries = 10
+	MaxRetransmitRetries = 16
 	MinRetransmitTimeout = 200 * time.Millisecond
-	MaxRetransmitTimeout = 30 * time.Second
+
+	// MaxRetransmitBackoff caps the wait between attempts. It is a ceiling, not
+	// a fixed interval, and never applies below the current RTO — retransmitting
+	// faster than the round trip just piles duplicates onto a path that has not
+	// had time to answer.
+	MaxRetransmitBackoff = 2 * time.Second
 )
