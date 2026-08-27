@@ -213,10 +213,39 @@ func (pm *PacketManager) GetPacket(seq uint32) *SentPacket {
 	return pm.sentPackets[seq]
 }
 
+// lossDelay returns how long a packet must have been outstanding before age
+// alone marks it lost: 9/8 of the larger of the smoothed and latest RTT, floored
+// at the timer granularity (RFC 9002 section 6.1.2).
+//
+// The larger of the two RTTs matters. After a sudden increase in delay the
+// smoothed estimate lags behind reality, and using it alone would declare a
+// whole window of packets lost for the crime of being slower than they used to
+// be — precisely when the path can least afford the duplicates.
+func (pm *PacketManager) lossDelay() time.Duration {
+	rtt := pm.cc.SmoothedRtt()
+	if latest := pm.cc.LatestRtt(); latest > rtt {
+		rtt = latest
+	}
+
+	delay := rtt * LossTimeThresholdNumerator / LossTimeThresholdDenominator
+	if delay < LossTimerGranularity {
+		delay = LossTimerGranularity
+	}
+	return delay
+}
+
 // DetectLostPackets examines SACK gaps in an AckFrame and returns sequence
-// numbers of packets that are inferred lost (present in sentPackets but
-// falling within a gap between acknowledged ranges). Packets that were
-// already retransmitted within the last RTO are skipped to prevent storms.
+// numbers of packets that are inferred lost.
+//
+// A gap is suspicion, not proof: UDP reorders, and a packet that arrives late
+// still arrives. Following RFC 9002 section 6.1, a gap only counts as loss once
+// the packet is either LossReorderThreshold sequence numbers behind the largest
+// acknowledged one, or older than lossDelay. Until then it is presumed still in
+// flight. This used to declare every gap lost on sight, which is why reordering
+// cost far more than loss did.
+//
+// Packets retransmitted within the last RTO are skipped regardless, so a run of
+// ACKs describing the same gap cannot re-send the same packet repeatedly.
 func (pm *PacketManager) DetectLostPackets(frame *AckFrame) []uint32 {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -226,6 +255,7 @@ func (pm *PacketManager) DetectLostPackets(frame *AckFrame) []uint32 {
 	}
 
 	rto := pm.retransmitTimeout()
+	lossDelay := pm.lossDelay()
 	now := pm.clock.Now()
 	var lost []uint32
 
@@ -243,6 +273,14 @@ func (pm *PacketManager) DetectLostPackets(frame *AckFrame) []uint32 {
 			if pkt, ok := pm.sentPackets[seq]; ok {
 				// Skip if already retransmitted recently.
 				if pkt.RetransmitCount > 0 && now.Sub(pkt.LastRetransmit) < rto {
+					cursor--
+					continue
+				}
+				// Neither far enough behind nor old enough: reordering still
+				// explains the gap, so leave it in flight. The RTO timer is the
+				// backstop if no further ACK ever resolves it.
+				behind := int64(frame.LargestAcked) - cursor
+				if behind < LossReorderThreshold && now.Sub(pkt.SentTime) < lossDelay {
 					cursor--
 					continue
 				}
