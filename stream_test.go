@@ -30,7 +30,7 @@ type mockReset struct {
 
 type mockWindowUpdate struct {
 	streamID, remoteID uint32
-	maxStreamData      int
+	maxStreamData      int64
 }
 
 type mockBlocked struct {
@@ -52,7 +52,7 @@ func (m *mockStreamConn) sendResetStream(streamID, remoteID uint32, errorCode ui
 	m.resets = append(m.resets, mockReset{streamID, remoteID, errorCode})
 }
 
-func (m *mockStreamConn) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int) {
+func (m *mockStreamConn) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.windowUpdates = append(m.windowUpdates, mockWindowUpdate{streamID, remoteID, maxStreamData})

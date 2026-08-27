@@ -1,0 +1,14 @@
+name: udx_interop_dartpeer
+description: >-
+  Bulk-transfer Dart peer for go-udx's interop suite. Lives here rather than in
+  dart-udx because it is go-udx test scaffolding: it exists to exercise the
+  Go implementation against a real Dart peer, not to ship with the Dart package.
+publish_to: none
+version: 0.0.1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  dart_udx:
+    path: ../../../dart-udx

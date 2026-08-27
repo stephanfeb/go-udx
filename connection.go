@@ -267,7 +267,11 @@ func (c *Connection) sendResetStream(streamID, remoteID uint32, errorCode uint32
 // sendWindowUpdate advertises an ABSOLUTE offset limit for the stream: the
 // highest cumulative byte position the peer may send. It is not a window size.
 // See StreamFlowController for why absolute offsets are required here.
-func (c *Connection) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int) {
+//
+// The uint32 conversion is a deliberate truncation: the offset travels modulo
+// 2^32 and the peer reconstructs it against the limit it already holds, which
+// is what keeps a stream's lifetime transfer unbounded over a 4-byte field.
+func (c *Connection) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int64) {
 	frame := &WindowUpdateFrame{WindowSize: uint32(maxStreamData)}
 	c.sendPacket(remoteID, streamID, []Frame{frame})
 }
@@ -697,7 +701,7 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 		// inflate our receive buffer just by claiming to be blocked.
 		if s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID); s != nil {
 			if s.streamFC != nil {
-				c.sendWindowUpdate(s.ID, s.RemoteID, int(s.streamFC.RefreshLimit()))
+				c.sendWindowUpdate(s.ID, s.RemoteID, s.streamFC.RefreshLimit())
 			}
 		}
 	}
@@ -780,7 +784,7 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 func (c *Connection) handleWindowUpdate(pkt *Packet, f *WindowUpdateFrame) {
 	s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID)
 	if s != nil {
-		s.OnWindowUpdate(int64(f.WindowSize))
+		s.OnWindowUpdate(f.WindowSize)
 	}
 }
 

@@ -407,3 +407,87 @@ func TestTransfer_NoAckAmplification(t *testing.T) {
 	t.Logf("%d data packets => %d ack-only datagrams, %d total",
 		dataPkts, got, atomic.LoadInt64(&totalPkts))
 }
+
+// TestTransfer_SlowConsumerAppliesBackpressure is the end-to-end proof that
+// flow control actually binds. A receiver that drains slowly must stall its
+// sender and keep its own buffer bounded; if the advertised offset is
+// misinterpreted as "bytes currently outstanding" — which is what dart-udx's
+// sender does today — the limit stops binding and recvBuf grows without end.
+//
+// This is the Go-to-Go form. The cross-implementation form lives in
+// interop/, where it is the test that settles the Go/Dart semantics question.
+func TestTransfer_SlowConsumerAppliesBackpressure(t *testing.T) {
+	conn, srvConn, ctx := testPair(t, 60*time.Second)
+
+	stream, err := conn.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 8 << 20
+
+	type sample struct{ buffered, consumed int64 }
+	samples := make(chan sample, 1)
+
+	go func() {
+		srvStream, err := srvConn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		// Drain deliberately slowly: small reads with a pause between them.
+		buf := make([]byte, 4096)
+		var consumed int64
+		var peakBuffered int64
+		srvStream.SetReadDeadline(time.Now().Add(50 * time.Second))
+		for i := 0; i < 40; i++ {
+			n, err := srvStream.Read(buf)
+			consumed += int64(n)
+			if b := srvStream.streamFC.BufferedBytes(); b > peakBuffered {
+				peakBuffered = b
+			}
+			if err != nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		samples <- sample{peakBuffered, consumed}
+	}()
+
+	// Writer pushes as hard as it can and is expected NOT to finish.
+	writeDone := make(chan int64, 1)
+	go func() {
+		stream.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		n, _ := stream.Write(make([]byte, total))
+		writeDone <- int64(n)
+	}()
+
+	var written int64
+	select {
+	case written = <-writeDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("writer neither completed nor hit its deadline")
+	}
+
+	s := <-samples
+
+	if written >= total {
+		t.Fatalf("writer pushed all %d bytes past a slow reader that consumed only %d; "+
+			"flow control is not binding", total, s.consumed)
+	}
+
+	// The sender may run ahead by roughly one window plus what was consumed.
+	// Anything near the full payload means the limit stopped binding.
+	maxExpected := s.consumed + 2*int64(MaxStreamRecvWindow)
+	if written > maxExpected {
+		t.Fatalf("writer got %d bytes ahead of a reader that consumed %d (bound %d); "+
+			"the advertised offset is not restraining the sender", written, s.consumed, maxExpected)
+	}
+
+	if s.buffered > 2*int64(MaxStreamRecvWindow) {
+		t.Fatalf("receive buffer peaked at %d bytes, beyond twice the %d window; "+
+			"back-pressure is not bounding recvBuf", s.buffered, MaxStreamRecvWindow)
+	}
+
+	t.Logf("slow reader consumed %d bytes; sender advanced to %d; peak buffered %d (window cap %d)",
+		s.consumed, written, s.buffered, MaxStreamRecvWindow)
+}

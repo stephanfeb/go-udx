@@ -87,6 +87,37 @@ func (fc *FlowController) ConnMaxData() int64 {
 	return fc.connMaxData
 }
 
+// windowOffsetModulus is the arithmetic modulus of the WINDOW_UPDATE offset,
+// fixed by the frame's uint32 field.
+const windowOffsetModulus = int64(1) << 32
+
+// reconstructWindowOffset recovers a full 64-bit advertised offset from the
+// uint32 actually carried on the wire, choosing the candidate nearest the
+// reference (RFC 1982 serial-number arithmetic).
+//
+// This is unambiguous because the true offset is always within one receive
+// window of the limit we already hold: a receiver advertises consumed+window,
+// consumed never exceeds what we sent, and we never send past the previous
+// limit. With a window capped at MaxStreamRecvWindow (4MB) against a modulus of
+// 4GB, the nearest candidate is the correct one by a margin of some 500x.
+func reconstructWindowOffset(wire uint32, reference int64) int64 {
+	base := reference &^ (windowOffsetModulus - 1)
+	best := base + int64(wire)
+	for _, cand := range [2]int64{best - windowOffsetModulus, best + windowOffsetModulus} {
+		if absInt64(cand-reference) < absInt64(best-reference) {
+			best = cand
+		}
+	}
+	return best
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 // StreamFlowController manages per-stream flow control using absolute byte
 // offsets, following the QUIC MAX_STREAM_DATA model (RFC 9000 section 4.1).
 //
@@ -105,6 +136,13 @@ func (fc *FlowController) ConnMaxData() int64 {
 // The advertised offset is anchored to bytes *consumed* by the application
 // rather than bytes received, so a reader that stops draining the stream
 // applies real back-pressure and bounds recvBuf.
+//
+// WINDOW_UPDATE carries the offset in a uint32, so it is transmitted modulo
+// 2^32 and reconstructed by the sender relative to the limit it already holds
+// (see reconstructWindowOffset). Truncating there is deliberate, not a bug: it
+// is what keeps a stream's lifetime transfer unbounded without widening the
+// frame. Clamping instead would stall a stream permanently at 4GB, which is the
+// same defect as the original 256KB ceiling with a larger number on it.
 type StreamFlowController struct {
 	mu sync.Mutex
 
@@ -169,9 +207,20 @@ func (sfc *StreamFlowController) OnDataSent(n int) {
 	sfc.blocked = sfc.dataSent >= sfc.maxStreamData
 }
 
-// UpdateMaxStreamData applies a WINDOW_UPDATE from the peer. The argument is an
-// absolute offset. Updates are monotonic, so a stale or reordered frame can
-// never shrink the limit. Returns true if the limit advanced.
+// ApplyWindowUpdate applies a WINDOW_UPDATE received from the peer, whose
+// payload is the advertised offset modulo 2^32. Returns true if the limit
+// advanced. Reconstruction is anchored to the limit we already hold, which is
+// the tightest available bound on where the new one can be.
+func (sfc *StreamFlowController) ApplyWindowUpdate(wire uint32) bool {
+	sfc.mu.Lock()
+	anchor := sfc.maxStreamData
+	sfc.mu.Unlock()
+	return sfc.UpdateMaxStreamData(reconstructWindowOffset(wire, anchor))
+}
+
+// UpdateMaxStreamData applies an absolute offset limit from the peer. Updates
+// are monotonic, so a stale or reordered frame can never shrink the limit.
+// Returns true if the limit advanced.
 func (sfc *StreamFlowController) UpdateMaxStreamData(max int64) bool {
 	sfc.mu.Lock()
 	defer sfc.mu.Unlock()
@@ -250,15 +299,9 @@ func (sfc *StreamFlowController) RefreshLimit() int64 {
 
 // advertiseLocked computes and records the advertised offset. Caller holds mu.
 func (sfc *StreamFlowController) advertiseLocked() int64 {
+	// Tracked at full width; the uint32 truncation happens on the wire and is
+	// undone by reconstructWindowOffset on the peer.
 	limit := sfc.dataConsumed + sfc.recvWindow
-
-	// WINDOW_UPDATE carries the offset in a uint32, so it cannot express more
-	// than 4GB on a single stream. Clamp rather than wrap: a clamped stream
-	// stalls at the ceiling, whereas a wrapped one would hand the peer a limit
-	// below what it has already sent and corrupt the accounting.
-	if limit > MaxStreamDataOffset {
-		limit = MaxStreamDataOffset
-	}
 	if limit > sfc.lastAdvertised {
 		sfc.lastAdvertised = limit
 	}

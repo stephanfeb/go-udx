@@ -13,12 +13,6 @@ const (
 	// this many bytes before it earns the full window.
 	MaxStreamRecvWindow = 4 << 20 // 4 MB
 
-	// MaxStreamDataOffset is the largest absolute offset a WINDOW_UPDATE can
-	// carry, bounded by the frame's uint32 WindowSize field. This caps a single
-	// stream's lifetime transfer at 4GB; widening it requires a wire change
-	// coordinated with the Dart UDX implementation.
-	MaxStreamDataOffset = int64(1<<32 - 1)
-
 	// StreamBlockedRetryInterval is how often a flow-control-blocked writer
 	// re-sends STREAM_DATA_BLOCKED while waiting for credit. WINDOW_UPDATE and
 	// STREAM_DATA_BLOCKED both ride seq=0 control packets that are never

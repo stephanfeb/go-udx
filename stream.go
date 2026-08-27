@@ -46,13 +46,13 @@ type Stream struct {
 	writeDeadline time.Time
 
 	// Receive side
-	recvBuf        []byte            // ordered data ready for reading
-	recvOOO        map[uint32][]byte // out-of-order buffer: seq -> data
-	nextExpectSeq  uint32
-	recvSeqInit    bool // true after first DeliverData sets nextExpectSeq
-	recvCond       *sync.Cond
-	readDeadline   time.Time
-	finReceived    bool
+	recvBuf       []byte            // ordered data ready for reading
+	recvOOO       map[uint32][]byte // out-of-order buffer: seq -> data
+	nextExpectSeq uint32
+	recvSeqInit   bool // true after first DeliverData sets nextExpectSeq
+	recvCond      *sync.Cond
+	readDeadline  time.Time
+	finReceived   bool
 
 	// Flow control
 	streamFC *StreamFlowController
@@ -69,7 +69,7 @@ type Stream struct {
 type streamConn interface {
 	sendStreamFrame(streamID uint32, remoteID uint32, data []byte, isFin bool, isSyn bool)
 	sendResetStream(streamID uint32, remoteID uint32, errorCode uint32)
-	sendWindowUpdate(streamID uint32, remoteID uint32, maxStreamData int)
+	sendWindowUpdate(streamID uint32, remoteID uint32, maxStreamData int64)
 	sendStreamDataBlocked(streamID uint32, remoteID uint32, limit int64)
 	awaitSendCredit(size int, deadline time.Time) bool
 	clock() Clock
@@ -78,11 +78,11 @@ type streamConn interface {
 // NewStream creates a new stream.
 func NewStream(id uint32, remoteID uint32, fc *StreamFlowController) *Stream {
 	s := &Stream{
-		ID:        id,
-		RemoteID:  remoteID,
-		state:     StreamStateIdle,
-		recvOOO:   make(map[uint32][]byte),
-		streamFC:  fc,
+		ID:       id,
+		RemoteID: remoteID,
+		state:    StreamStateIdle,
+		recvOOO:  make(map[uint32][]byte),
+		streamFC: fc,
 	}
 	s.sendCond = sync.NewCond(&s.mu)
 	s.recvCond = sync.NewCond(&s.mu)
@@ -132,7 +132,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 
 	// Send the update without holding s.mu to avoid deadlock with c.mu.
 	if sendUpdate && conn != nil {
-		conn.sendWindowUpdate(id, remoteID, int(s.streamFC.AdvertiseLimit()))
+		conn.sendWindowUpdate(id, remoteID, s.streamFC.AdvertiseLimit())
 	}
 	return n, nil
 }
@@ -459,14 +459,43 @@ func (s *Stream) DeliverReset(errorCode uint32) {
 }
 
 // OnWindowUpdate is called when a WINDOW_UPDATE is received for this stream.
-func (s *Stream) OnWindowUpdate(maxStreamData int64) {
+// wire is the frame's payload: the peer's advertised offset modulo 2^32.
+func (s *Stream) OnWindowUpdate(wire uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.streamFC != nil {
-		s.streamFC.UpdateMaxStreamData(maxStreamData)
+		s.streamFC.ApplyWindowUpdate(wire)
 	}
 	s.sendCond.Broadcast()
+}
+
+// BufferedBytes returns bytes received on this stream but not yet consumed by
+// the application. Exported so flow-control back-pressure can be asserted from
+// outside the package, notably by the Go<->Dart interop tests.
+func (s *Stream) BufferedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.streamFC == nil {
+		return 0
+	}
+	return s.streamFC.BufferedBytes()
+}
+
+// RecvWindow returns the current auto-tuned receive window for this stream.
+//
+// Together with BufferedBytes this pins the flow-control invariant a compliant
+// peer must satisfy: we advertise dataConsumed + recvWindow as an absolute
+// offset, and a sender that respects it can never have more than recvWindow
+// bytes outstanding and unconsumed. BufferedBytes() <= RecvWindow() is
+// therefore the exact test of whether a peer honours the advertised offset.
+func (s *Stream) RecvWindow() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.streamFC == nil {
+		return 0
+	}
+	return s.streamFC.RecvWindow()
 }
 
 // State returns the current stream state.

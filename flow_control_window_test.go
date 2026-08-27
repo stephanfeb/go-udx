@@ -192,25 +192,139 @@ func TestStreamFC_BackpressureWithoutConsumption(t *testing.T) {
 	}
 }
 
-// TestStreamFC_ClampsToUint32 covers the wire ceiling: WINDOW_UPDATE carries the
-// offset in a uint32, so the advertised value must saturate rather than wrap.
-// A wrapped offset would hand the peer a limit below what it had already sent.
-func TestStreamFC_ClampsToUint32(t *testing.T) {
-	sfc := NewStreamFlowController(int64(InitialMaxStreamData), MaxStreamRecvWindow)
+// TestStreamFC_WireOffsetSurvivesWraparound covers the 4GB wire ceiling. The
+// offset travels in a uint32, so beyond 4GB it wraps; the sender reconstructs it
+// against the limit it already holds. Clamping instead would stall the stream
+// permanently at 4GB — the original 256KB ceiling with a bigger number on it.
+func TestStreamFC_WireOffsetSurvivesWraparound(t *testing.T) {
+	const window = int64(MaxStreamRecvWindow)
 
-	sfc.OnDataReceived(1)
-	sfc.OnDataConsumed(1)
-	// Jump consumption to just under the ceiling.
-	sfc.OnDataConsumed(int(MaxStreamDataOffset - 1))
+	// Park the sender just below the wrap point.
+	sender := NewStreamFlowController(int64(InitialMaxStreamData), int64(InitialMaxStreamData))
+	nearWrap := windowOffsetModulus - window/2
+	sender.UpdateMaxStreamData(nearWrap)
+	sender.OnDataSent(int(nearWrap))
 
-	limit := sfc.AdvertiseLimit()
-	if limit > MaxStreamDataOffset {
-		t.Fatalf("advertised %d, exceeds the uint32 wire ceiling %d", limit, MaxStreamDataOffset)
+	if sender.CanSend(1) {
+		t.Fatal("sender should be at its limit before the wrap")
 	}
-	if limit != MaxStreamDataOffset {
-		t.Fatalf("advertised %d, want the clamped ceiling %d", limit, MaxStreamDataOffset)
+
+	// Receiver advertises past the modulus; the wire carries the low 32 bits.
+	receiver := NewStreamFlowController(int64(InitialMaxStreamData), window)
+	receiver.OnDataConsumed(int(nearWrap))
+	limit := receiver.AdvertiseLimit()
+	if limit <= windowOffsetModulus {
+		t.Fatalf("test setup: advertised %d did not cross the modulus %d", limit, windowOffsetModulus)
 	}
-	if uint32(limit) != uint32(MaxStreamDataOffset) {
-		t.Fatalf("advertised offset does not survive the uint32 wire encoding")
+
+	wire := uint32(limit) // deliberate truncation, exactly as the frame does
+	if !sender.ApplyWindowUpdate(wire) {
+		t.Fatal("sender rejected a window update that crossed the 4GB wrap point")
+	}
+
+	if got := sender.SendLimit(); got != limit {
+		t.Fatalf("reconstructed offset %d, want %d (wire value %d)", got, limit, wire)
+	}
+	if !sender.CanSend(1) {
+		t.Fatal("sender still blocked past the 4GB wrap; the stream is permanently stalled")
+	}
+}
+
+// TestReconstructWindowOffset_PicksNearestCandidate pins the reconstruction
+// itself, including exactly on the modulus boundary.
+func TestReconstructWindowOffset_PicksNearestCandidate(t *testing.T) {
+	cases := []struct {
+		name      string
+		full      int64 // true offset the peer advertised
+		reference int64 // limit we already hold
+	}{
+		{"origin", 65536, 0},
+		{"mid range", 5 << 20, 4 << 20},
+		{"just below wrap", windowOffsetModulus - 1024, windowOffsetModulus - (4 << 20)},
+		{"exactly at wrap", windowOffsetModulus, windowOffsetModulus - 1024},
+		{"just past wrap", windowOffsetModulus + 4096, windowOffsetModulus - 4096},
+		{"far past wrap", 9*windowOffsetModulus + 777, 9 * windowOffsetModulus},
+		{"second wrap boundary", 2 * windowOffsetModulus, 2*windowOffsetModulus - 512},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reconstructWindowOffset(uint32(tc.full), tc.reference)
+			if got != tc.full {
+				t.Fatalf("reconstructed %d from wire %d against reference %d, want %d",
+					got, uint32(tc.full), tc.reference, tc.full)
+			}
+		})
+	}
+}
+
+// TestReconstructWindowOffset_ExhaustiveAcrossWrap walks a full window's worth
+// of offsets straight through the modulus boundary, one byte at a time, to
+// confirm nothing is misreconstructed anywhere in the crossing.
+func TestReconstructWindowOffset_ExhaustiveAcrossWrap(t *testing.T) {
+	// Sweep the reference alongside the offset the way a real stream does.
+	start := windowOffsetModulus - 2048
+	reference := start
+	for full := start; full < start+4096; full++ {
+		got := reconstructWindowOffset(uint32(full), reference)
+		if got != full {
+			t.Fatalf("offset %d (wire %d, reference %d) reconstructed as %d",
+				full, uint32(full), reference, got)
+		}
+		// The limit the sender holds trails the advertised offset.
+		if full%64 == 0 {
+			reference = full
+		}
+	}
+}
+
+// TestStreamFC_SustainedTransferAcrossWrap drives the real controllers through
+// the 4GB boundary to confirm the exchange keeps flowing across it.
+func TestStreamFC_SustainedTransferAcrossWrap(t *testing.T) {
+	sender := NewStreamFlowController(int64(InitialMaxStreamData), int64(InitialMaxStreamData))
+	receiver := NewStreamFlowController(int64(InitialMaxStreamData), MaxStreamRecvWindow)
+
+	// Fast-forward both sides to just short of the wrap.
+	const runway = 8 << 20
+	jump := windowOffsetModulus - runway
+	sender.UpdateMaxStreamData(jump)
+	sender.OnDataSent(int(jump))
+	receiver.OnDataReceived(int(jump))
+	receiver.OnDataConsumed(int(jump))
+	sender.UpdateMaxStreamData(receiver.AdvertiseLimit())
+
+	const chunk = MaxDatagramSize - 100
+	target := jump + 2*runway // finish well past the modulus
+
+	var delivered = jump
+	spins := 0
+	for delivered < target {
+		if !sender.CanSend(1) {
+			spins++
+			if spins > 2 {
+				t.Fatalf("stalled at %d bytes (%.2f GB), %d bytes from the wrap point: sendLimit=%d advertised=%d",
+					delivered, float64(delivered)/float64(1<<30),
+					windowOffsetModulus-delivered, sender.SendLimit(), receiver.AdvertisedLimit())
+			}
+			continue
+		}
+		spins = 0
+
+		n := chunk
+		if avail := sender.SendWindowAvailable(); avail < int64(n) {
+			n = int(avail)
+		}
+		sender.OnDataSent(n)
+		delivered += int64(n)
+
+		receiver.OnDataReceived(n)
+		if receiver.OnDataConsumed(n) {
+			// Through the wire, truncated exactly as the frame does.
+			sender.ApplyWindowUpdate(uint32(receiver.AdvertiseLimit()))
+		}
+	}
+
+	if sender.SendLimit() <= windowOffsetModulus {
+		t.Fatalf("send limit %d never advanced past the modulus", sender.SendLimit())
 	}
 }
