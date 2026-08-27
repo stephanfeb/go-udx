@@ -1,10 +1,18 @@
 # Patch for dart-udx: honour the advertised stream offset
 
-**Status:** proposed, not applied and **not yet executed** — this is a `dart-udx`
-change, written up here because `go-udx`'s interop suite is what demonstrates the
-defect. The diffs below are derived from reading `dart-udx@5291cdb`; they have
-not been compiled or run. Validate by applying them and re-running the interop
-test named below, which fails today and should go green.
+**Status: APPLIED and verified** against `dart-udx@5291cdb` (working tree, not
+committed). Written up here because `go-udx`'s interop suite is what
+demonstrates the defect.
+
+Result:
+
+| | Before | After |
+|---|---|---|
+| Buffered unread, slow Go reader | 2,030,400 B | 187,088 B |
+| Advertised window at that point | 524,288 B | 524,288 B |
+| Invariant `buffered <= window` | violated 3.9x | holds |
+
+`go-udx` interop 6/6 pass. `dart-udx` 108 pass / 2 skipped / 0 fail.
 
 **Proves it:** `interop/bulk_interop_test.go` → `TestBulk_DartToGoSlowConsumer`.
 That test fails today and goes green when this patch lands.
@@ -141,6 +149,41 @@ go test ./interop/ -run TestBulk -v
 must satisfy — `BufferedBytes() <= RecvWindow()` — and names this document when
 it fails. `TestBulk_DartToGoUpload` and `TestBulk_GoToDartDownload` already pass
 and should stay passing.
+
+## Two dart-udx tests were rewritten
+
+`test/flow_control_test.dart` used `setWindow(0)` to block a sender and
+`setWindow(65536)` to release it. Absolute-offset flow control cannot express
+that: credit once granted is not revocable, and `deliverWindowUpdate` is now
+monotonic — which is exactly what makes a dropped or reordered update safe.
+`setWindow` has no callers in `lib/` or `bin/`, so no shipped behaviour depended
+on it.
+
+The two tests were replaced with four that exercise the real paths: the sender
+never exceeds its granted offset, a draining receiver keeps the sender moving, a
+stale or zero update never revokes credit, and an offset reconstructs across the
+4GB wrap.
+
+One caveat found while writing them, worth knowing: reconstruction assumes each
+update lands within one window of the current limit. A single 4GB leap is
+genuinely ambiguous and is correctly rejected, so a test that walks to the
+boundary must step there rather than jump.
+
+## Open: dart-udx's receiver has no consumption back-pressure
+
+Not part of this patch, found while testing it.
+
+`_deliverDataInternal` (`stream.dart:228`) advertises on bytes **received**, not
+bytes consumed by the application, so a Dart receiver keeps granting credit
+whether or not anyone is reading. A Go -> Dart transfer against a slow Dart
+reader therefore has no stream-level back-pressure and Dart's buffer can grow
+without bound. `go-udx` anchors its own advertisement to consumption, which is
+why the Dart -> Go direction is now bounded.
+
+This is the mirror image of the sender bug just fixed and wants the same
+treatment: advertise `bytesConsumed + window` rather than
+`initialWindow + bytesReceived`. It is a larger change because Dart's receive
+path hands data to a `StreamController`, so "consumed" needs defining.
 
 ## Naming, optional but recommended
 
