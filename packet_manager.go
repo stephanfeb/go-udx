@@ -146,7 +146,20 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 				acked = append(acked, pkt)
 			}
 		}
-		currentSeq = rangeEnd - int64(r.AckRangeLength) - 1 + 1 - 1
+		// Advance past the range just acknowledged. The next unacknowledged
+		// sequence is rangeEnd - AckRangeLength: rangeEnd is the highest seq in
+		// the range and AckRangeLength of them were acked going down.
+		//
+		// This was rangeEnd - AckRangeLength - 1, one too low, which shifted
+		// every range after the first down by one. The sender then deleted
+		// sequences the peer had never acknowledged — so those packets were
+		// never retransmitted and the receiver waited for them forever, while
+		// sequences that really were acked stayed tracked. It only bites with
+		// two or more SACK ranges, i.e. multiple distinct losses in flight,
+		// which is why it showed up as loss-rate-dependent stalling rather than
+		// an outright failure. DetectLostPackets walks the same structure and
+		// has always done this correctly.
+		currentSeq = rangeEnd - int64(r.AckRangeLength)
 	}
 
 	return acked
