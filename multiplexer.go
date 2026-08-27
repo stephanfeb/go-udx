@@ -199,6 +199,17 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 		return
 	}
 
+	// The version field was written on every packet and never read. That was
+	// harmless while the wire format only ever grew compatible additions, and
+	// stopped being harmless in V3: the STREAM frame gained an offset where a
+	// V2 parser expects the data length, so an older peer reads a plausible
+	// wrong length and hands nonsense to the application rather than failing.
+	// Dropping the packet makes a version mismatch look like an unreachable
+	// peer, which is recoverable and diagnosable, instead of corruption.
+	if pkt.Version != VersionCurrent {
+		return
+	}
+
 	// Route by destination CID
 	cidKey := pkt.DestinationCID.String()
 

@@ -13,6 +13,14 @@ const (
 	// this many bytes before it earns the full window.
 	MaxStreamRecvWindow = 4 << 20 // 4 MB
 
+	// maxStreamRecvOOO backstops the per-stream out-of-order buffer. Flow
+	// control is what actually bounds it; this only catches a peer ignoring its
+	// limit, so it sits above the largest window rather than at it. Set equal
+	// to MaxStreamRecvWindow it fires during legitimate transfers, and since
+	// the packet has already been acknowledged by then, the refused bytes are
+	// never re-sent and the stream stalls forever.
+	maxStreamRecvOOO = 2 * MaxStreamRecvWindow
+
 	// StreamBlockedRetryInterval is how often a flow-control-blocked writer
 	// re-sends STREAM_DATA_BLOCKED while waiting for credit. WINDOW_UPDATE and
 	// STREAM_DATA_BLOCKED both ride seq=0 control packets that are never
@@ -24,12 +32,6 @@ const (
 	// before re-checking. A lost ACK must not wedge it: the PTO timer needs a
 	// chance to retransmit and release inflight bytes.
 	sendCreditPollInterval = 5 * time.Millisecond
-
-	// maxConnRecvOOO caps how many data packets the connection holds while
-	// waiting for a gap to be filled. In-flight data is already bounded by the
-	// congestion window, so this only ever trips on a pathological peer;
-	// overflow costs a retransmission, not correctness.
-	maxConnRecvOOO = 4096
 
 	InitialMaxStreams     = 100
 	MaxAckDelay          = 25 * time.Millisecond
@@ -125,10 +127,18 @@ const (
 )
 
 // Protocol Versions
+//
+// V3 added the byte offset to STREAM frames. It is not compatible with V2: the
+// eight extra bytes sit where a V2 parser expects the data length, so a V2 peer
+// does not fail on a V3 frame, it reads a plausible wrong length and delivers
+// nonsense into the byte stream. Multiplexer.handleDatagram drops packets with
+// an unsupported version for exactly that reason — a version mismatch has to be
+// a dropped packet, not silent corruption.
 const (
 	VersionV1      uint32 = 0x00000001
 	VersionV2      uint32 = 0x00000002
-	VersionCurrent        = VersionV2
+	VersionV3      uint32 = 0x00000003
+	VersionCurrent        = VersionV3
 )
 
 // Retransmission

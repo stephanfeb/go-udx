@@ -181,14 +181,32 @@ const (
 )
 
 // StreamFrame carries data for a specific stream.
+//
+// Offset is the position of Data within the stream's own byte sequence, and it
+// is what the receiver reassembles on. Delivery order used to be taken from the
+// packet's sequence number instead, which is allocated per connection: a stream
+// saw only a sparse subsequence of it, so two streams on one connection
+// deadlocked each other, and every packet had to be reordered at the connection
+// before any stream could advance. Addressing the bytes directly means a stream
+// is held up only by its own missing data.
+//
+// The offset is a full 64 bits rather than the 32-bit-modulo trick
+// WINDOW_UPDATE uses. That trick exists there because the frame's width was
+// already fixed by the wire format; here the field is new, so there is no
+// reason to buy back eight bytes per packet at the cost of a wraparound
+// reconstruction on the delivery path.
 type StreamFrame struct {
-	IsFin bool
-	IsSyn bool
-	Data  []byte
+	IsFin  bool
+	IsSyn  bool
+	Offset uint64
+	Data   []byte
 }
 
+// streamFrameHeaderLen is type(1) + flags(1) + offset(8) + datalen(2).
+const streamFrameHeaderLen = 12
+
 func (f *StreamFrame) Type() FrameType { return FrameStream }
-func (f *StreamFrame) Len() int        { return 1 + 1 + 2 + len(f.Data) } // type+flags+datalen+data
+func (f *StreamFrame) Len() int        { return streamFrameHeaderLen + len(f.Data) }
 
 func (f *StreamFrame) Marshal() []byte {
 	buf := make([]byte, f.Len())
@@ -201,27 +219,30 @@ func (f *StreamFrame) Marshal() []byte {
 		flags |= StreamFlagSYN
 	}
 	buf[1] = flags
-	binary.BigEndian.PutUint16(buf[2:], uint16(len(f.Data)))
-	copy(buf[4:], f.Data)
+	binary.BigEndian.PutUint64(buf[2:], f.Offset)
+	binary.BigEndian.PutUint16(buf[10:], uint16(len(f.Data)))
+	copy(buf[streamFrameHeaderLen:], f.Data)
 	return buf
 }
 
 func unmarshalStreamFrame(data []byte, offset int) (*StreamFrame, int, error) {
-	if offset+4 > len(data) { // type+flags+datalen minimum
+	if offset+streamFrameHeaderLen > len(data) {
 		return nil, 0, fmt.Errorf("%w: STREAM frame header", ErrPacketTooShort)
 	}
 	flags := data[offset+1]
-	dataLen := int(binary.BigEndian.Uint16(data[offset+2:]))
-	if offset+4+dataLen > len(data) {
+	streamOffset := binary.BigEndian.Uint64(data[offset+2:])
+	dataLen := int(binary.BigEndian.Uint16(data[offset+10:]))
+	if offset+streamFrameHeaderLen+dataLen > len(data) {
 		return nil, 0, fmt.Errorf("%w: STREAM frame data", ErrPacketTooShort)
 	}
 	payload := make([]byte, dataLen)
-	copy(payload, data[offset+4:offset+4+dataLen])
+	copy(payload, data[offset+streamFrameHeaderLen:offset+streamFrameHeaderLen+dataLen])
 	return &StreamFrame{
-		IsFin: flags&StreamFlagFIN != 0,
-		IsSyn: flags&StreamFlagSYN != 0,
-		Data:  payload,
-	}, 4 + dataLen, nil
+		IsFin:  flags&StreamFlagFIN != 0,
+		IsSyn:  flags&StreamFlagSYN != 0,
+		Offset: streamOffset,
+		Data:   payload,
+	}, streamFrameHeaderLen + dataLen, nil
 }
 
 // --- WINDOW_UPDATE Frame (0x04) ---

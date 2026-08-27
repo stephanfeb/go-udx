@@ -78,7 +78,7 @@ func TestGoDartInterop(t *testing.T) {
 	testData := []byte("Hello from Go to Dart!")
 
 	pkt := &udx.Packet{
-		Version:             udx.VersionV2,
+		Version:             udx.VersionCurrent,
 		DestinationCID:      dcid,
 		SourceCID:           scid,
 		Sequence:            42,
@@ -113,9 +113,11 @@ func TestGoDartInterop(t *testing.T) {
 		t.Fatalf("unmarshal response: %v", err)
 	}
 
-	// Verify
-	if resp.Version != udx.VersionV2 {
-		t.Fatalf("version: got %d, want %d", resp.Version, udx.VersionV2)
+	// Verify. Pinned to the current version rather than a literal: both
+	// implementations must agree on it, and hardcoding one meant a version bump
+	// looked like an interop failure.
+	if resp.Version != udx.VersionCurrent {
+		t.Fatalf("version: got %d, want %d", resp.Version, udx.VersionCurrent)
 	}
 	if !resp.DestinationCID.Equal(scid) {
 		t.Fatalf("dest CID: got %s, want %s", resp.DestinationCID, scid)

@@ -388,168 +388,119 @@ func TestMultiStream_OneStreamClosingLeavesOthersRunning(t *testing.T) {
 	}
 }
 
-// newReassemblyConn builds the minimum Connection state reassemble touches.
-func newReassemblyConn() *Connection {
-	return &Connection{recvOOO: make(map[uint32]*Packet)}
-}
+// TestStreamReassembly_ReleasesContiguousRun covers the buffer-and-flush path
+// directly: bytes that arrive ahead of a gap wait, and are released in one go
+// once the gap closes.
+func TestStreamReassembly_ReleasesContiguousRun(t *testing.T) {
+	s, _ := newTestStream(t)
 
-func dataPacket(seq uint32) *Packet {
-	return &Packet{Sequence: seq, Frames: []Frame{&StreamFrame{Data: []byte{byte(seq)}}}}
-}
+	// "world" arrives before "hello", so nothing is readable yet.
+	s.DeliverData(5, []byte("world"))
+	s.mu.Lock()
+	readable := len(s.recvBuf)
+	s.mu.Unlock()
+	if readable != 0 {
+		t.Fatalf("%d bytes readable while the opening bytes are missing", readable)
+	}
 
-func seqsOf(pkts []*Packet) []uint32 {
-	out := make([]uint32, len(pkts))
-	for i, p := range pkts {
-		out[i] = p.Sequence
-	}
-	return out
-}
+	s.DeliverData(0, []byte("hello"))
 
-// TestReassemble_ReleasesContiguousRunInOrder covers the buffer-and-flush path
-// directly, including the baseline being the peer's first sequence rather than
-// zero — the handshake may consume sequences before any stream data.
-func TestReassemble_ReleasesContiguousRunInOrder(t *testing.T) {
-	c := newReassemblyConn()
-
-	if got := seqsOf(c.reassemble(dataPacket(7))); len(got) != 1 || got[0] != 7 {
-		t.Fatalf("first packet: released %v, want [7]", got)
+	buf := make([]byte, 32)
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 9 and 10 arrive before 8 and must be held.
-	for _, seq := range []uint32{9, 10} {
-		if got := c.reassemble(dataPacket(seq)); got != nil {
-			t.Fatalf("seq %d released %v while 8 was missing", seq, seqsOf(got))
-		}
-	}
-	got := seqsOf(c.reassemble(dataPacket(8)))
-	want := []uint32{8, 9, 10}
-	if len(got) != len(want) {
-		t.Fatalf("filling the gap released %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("filling the gap released %v, want %v", got, want)
-		}
-	}
-	if len(c.recvOOO) != 0 {
-		t.Fatalf("%d packets left buffered after the gap closed", len(c.recvOOO))
+	if string(buf[:n]) != "helloworld" {
+		t.Fatalf("read %q, want %q", buf[:n], "helloworld")
 	}
 }
 
-// TestReassemble_DeliversEachSequenceExactlyOnce is the guarantee the Noise
+// TestStreamReassembly_DeliversEachByteExactlyOnce is the guarantee the Noise
 // layer above depends on: its nonce counter is sequential, so a byte delivered
-// twice is a MAC failure, not a duplicated read.
-func TestReassemble_DeliversEachSequenceExactlyOnce(t *testing.T) {
-	c := newReassemblyConn()
+// twice is a MAC failure, not a duplicated read. Retransmissions arrive as
+// exact repeats and as partial overlaps, and neither may reach the reader.
+func TestStreamReassembly_DeliversEachByteExactlyOnce(t *testing.T) {
+	s, _ := newTestStream(t)
 
-	c.reassemble(dataPacket(0))
-	if got := c.reassemble(dataPacket(0)); got != nil {
-		t.Fatalf("re-delivered an already-released sequence: %v", seqsOf(got))
+	s.DeliverData(0, []byte("hello"))
+	s.DeliverData(0, []byte("hello"))       // exact retransmission
+	s.DeliverData(3, []byte("lo world"))    // overlaps the delivered tail
+	s.DeliverData(0, []byte("hello world")) // wholly overlapping repeat
+
+	buf := make([]byte, 64)
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// A duplicate arriving while still buffered must not displace the original
-	// or be released twice when the gap closes.
-	c.reassemble(dataPacket(2))
-	c.reassemble(dataPacket(2))
-	if got := seqsOf(c.reassemble(dataPacket(1))); len(got) != 2 {
-		t.Fatalf("gap close released %v, want exactly [1 2]", got)
-	}
-}
-
-// TestReassemble_BufferIsCapped keeps the out-of-order buffer bounded. Anything
-// refused here is still tracked by the peer's packet manager and retransmitted,
-// so overflow costs throughput rather than correctness — but only because
-// HandlePacket will accept that retransmission, which is what the next test
-// pins.
-func TestReassemble_BufferIsCapped(t *testing.T) {
-	c := newReassemblyConn()
-	c.reassemble(dataPacket(0)) // baseline; next expected is 1
-
-	for seq := uint32(2); len(c.recvOOO) < maxConnRecvOOO; seq++ {
-		c.reassemble(dataPacket(seq))
-	}
-	overflow := uint32(maxConnRecvOOO + 100)
-	c.reassemble(dataPacket(overflow))
-	if _, buffered := c.recvOOO[overflow]; buffered {
-		t.Fatalf("buffer grew past its %d-packet cap", maxConnRecvOOO)
+	if string(buf[:n]) != "hello world" {
+		t.Fatalf("read %q, want %q", buf[:n], "hello world")
 	}
 }
 
-// TestHandlePacket_RetransmitOfAnUndeliveredPacketIsAccepted pins the reason
-// the old (sequence, marshaledSize) dedupe table had to go.
+// TestStreamReassembly_BufferIsCapped stops a peer that ignores its flow-control
+// limit from growing the out-of-order buffer without end. Anything refused is
+// still tracked by that peer and will be retransmitted, so overflow costs
+// throughput rather than correctness.
+func TestStreamReassembly_BufferIsCapped(t *testing.T) {
+	s, _ := newTestStream(t)
+
+	// Everything lands ahead of a gap at offset 0, so none of it can be
+	// released and it all has to be held.
+	chunk := make([]byte, 64<<10)
+	offset := uint64(1)
+	for s.oooBytes+len(chunk) <= maxStreamRecvOOO {
+		s.DeliverData(offset, chunk)
+		offset += uint64(len(chunk))
+	}
+	before := s.oooBytes
+	s.DeliverData(offset, chunk)
+	if s.oooBytes != before {
+		t.Fatalf("buffer grew past the %d-byte backstop: %d bytes held", maxStreamRecvOOO, s.oooBytes)
+	}
+
+	// Overrunning the backstop is the peer's fault and must be loud. Silently
+	// dropping the bytes strands the stream: the packet was acknowledged on
+	// arrival, so the sender will never send them again.
+	if s.State() != StreamStateReset {
+		t.Fatal("overrunning the out-of-order backstop did not fail the stream; " +
+			"the discarded bytes are never re-sent, so it would hang forever")
+	}
+}
+
+// TestStreamReassembly_FinDoesNotTruncateTheTail pins the reason a FIN carries
+// the stream's final size rather than acting as EOF on arrival.
 //
-// That table was consulted in HandlePacket, before reassembly could refuse
-// anything, and recorded every packet on arrival. So a packet dropped for want
-// of reassembly buffer was already marked seen, and its retransmission — by
-// then the only surviving copy — was discarded as a duplicate. The stream
-// waited on a sequence that would never be offered again. The table was also
-// trimmed above 1000 entries, so it could not be relied on in the other
-// direction either. Sequence order answers the question exactly.
-//
-// This drives HandlePacket rather than reassemble because the defect was in the
-// gate ahead of it: a test on reassemble alone passes with the gate restored.
-// It has to overflow the buffer for real, because that is the only way a packet
-// gets recorded as seen and then discarded without being delivered.
-func TestHandlePacket_RetransmitOfAnUndeliveredPacketIsAccepted(t *testing.T) {
-	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
-	local, _ := NewConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
-	remote, _ := NewConnectionID([]byte{8, 7, 6, 5, 4, 3, 2, 1})
-	c := NewConnection(local, remote, addr, addr, false, RealClock{},
-		func([]byte, net.Addr) error { return nil })
-	c.addrValidated = true
+// A FIN is a flag on a frame that can overtake data still in flight. Closing
+// the stream when it lands would drop whatever had not caught up, silently
+// truncating the transfer at whatever offset happened to have arrived.
+func TestStreamReassembly_FinDoesNotTruncateTheTail(t *testing.T) {
+	s, _ := newTestStream(t)
 
-	s := NewStream(4, 2, NewStreamFlowController(1<<20, 1<<20))
-	s.conn = c
-	s.state = StreamStateOpen
-	c.streams[4] = s
+	// The FIN arrives first, announcing 11 bytes; only the tail has landed.
+	s.DeliverData(5, []byte(" world"))
+	s.DeliverFin(11)
 
-	deliver := func(seq uint32) {
-		c.HandlePacket(&Packet{
-			Sequence:            seq,
-			DestinationStreamID: 4,
-			SourceStreamID:      2,
-			Frames:              []Frame{&StreamFrame{Data: []byte{byte(seq)}}},
-		})
+	if s.finReceived {
+		t.Fatal("stream reported complete while the opening bytes were still missing")
+	}
+	buf := make([]byte, 64)
+	s.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := s.Read(buf); err != ErrDeadlineExceeded {
+		t.Fatalf("read returned %v; a premature EOF would have truncated the stream", err)
 	}
 
-	// Sequence 0 establishes the baseline and is delivered; 1 is lost, so
-	// everything above it must be held.
-	deliver(0)
-	const overflow = uint32(maxConnRecvOOO + 2)
-	for seq := uint32(2); seq < overflow; seq++ {
-		deliver(seq)
-	}
-	if len(c.recvOOO) != maxConnRecvOOO {
-		t.Fatalf("buffer holds %d packets, expected it full at %d", len(c.recvOOO), maxConnRecvOOO)
-	}
+	s.DeliverData(0, []byte("hello"))
 
-	// This one arrives with the buffer full and is discarded — but it was still
-	// recorded on arrival by the old gate.
-	deliver(overflow)
-
-	// The gap closes and everything buffered drains, leaving the discarded
-	// packet as the next one expected.
-	deliver(1)
-	if c.nextExpectSeq != overflow {
-		t.Fatalf("next expected sequence is %d, want %d", c.nextExpectSeq, overflow)
-	}
-
-	// The peer retransmits it. This is the only surviving copy.
-	deliver(overflow)
-
-	want := int(overflow) + 1 // sequences 0..overflow, one byte each
-	got := make([]byte, 0, want)
-	buf := make([]byte, 8192)
 	s.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for len(got) < want {
-		n, err := s.Read(buf)
-		got = append(got, buf[:n]...)
-		if err != nil {
-			t.Fatalf("stalled after %d of %d bytes — the retransmission was refused "+
-				"and the stream can never advance: %v", len(got), want, err)
-		}
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if last, wantLast := got[len(got)-1], byte(overflow%256); last != wantLast {
-		t.Fatalf("last byte is %d, want %d", last, wantLast)
+	if string(buf[:n]) != "hello world" {
+		t.Fatalf("read %q, want %q", buf[:n], "hello world")
+	}
+	if !s.finReceived {
+		t.Fatal("stream did not complete once every byte up to the final size arrived")
 	}
 }
 
@@ -606,5 +557,209 @@ func (c *disorderlyPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		return len(b), nil
 	default:
 		return c.PacketConn.WriteTo(b, addr)
+	}
+}
+
+// TestMultiStream_OneStreamStallDoesNotBlockAnother is the property the byte
+// offsets were added for.
+//
+// Delivery order used to come from the packet sequence number, which is
+// allocated per connection. A gap in it stalled the connection's reassembly, so
+// every stream waited on the missing packet regardless of which stream it
+// belonged to — one slow or lossy stream held up all its siblings. With STREAM
+// frames carrying their own offsets, a stream is delayed only by its own bytes.
+//
+// The path here blocks one stream completely for a fixed period. The other must
+// finish well inside it.
+func TestMultiStream_OneStreamStallDoesNotBlockAnother(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out a deliberate stall; skipped under -short")
+	}
+
+	const stalled = 8 << 10   // small, so the blocked stream does not eat the window
+	const flowing = 256 << 10 // large enough that finishing early is meaningful
+	const blockFor = 3 * time.Second
+
+	serverUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stream IDs are odd for the initiator, so the client's first stream is 1.
+	path := &streamBlockingPath{PacketConn: clientUDP, blockStream: 1, until: time.Now().Add(blockFor)}
+
+	server := NewMultiplexer(serverUDP, RealClock{})
+	client := NewMultiplexer(path, RealClock{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+
+	conn, err := client.Dial(ctx, server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvConn, err := server.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := conn.OpenStream(ctx) // stream 1, the one the path holds
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := conn.OpenStream(ctx) // stream 3, unimpeded
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each stream announces itself by size, since the server accepts them in
+	// whatever order their first packet lands.
+	done := make(chan int, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			s, err := srvConn.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(s *Stream) {
+				got, err := drain(s, flowing, 40*time.Second)
+				if err != nil && len(got) != stalled {
+					done <- -1
+					return
+				}
+				done <- len(got)
+			}(s)
+		}
+	}()
+
+	started := time.Now()
+	go func() {
+		blocked.SetWriteDeadline(time.Now().Add(40 * time.Second))
+		blocked.Write(pattern(stalled))
+	}()
+	go func() {
+		open.SetWriteDeadline(time.Now().Add(40 * time.Second))
+		open.Write(pattern(flowing))
+	}()
+
+	// The first stream to finish must be the unimpeded one, and it must finish
+	// before the block is lifted. Waiting for the block to expire would mean the
+	// two streams are still coupled.
+	select {
+	case n := <-done:
+		elapsed := time.Since(started)
+		if n != flowing {
+			t.Fatalf("first stream to complete carried %d bytes, want the unblocked stream's %d", n, flowing)
+		}
+		if elapsed >= blockFor {
+			t.Fatalf("the unblocked stream took %v to finish, longer than the %v stall on its "+
+				"sibling — the streams are still coupled", elapsed.Round(time.Millisecond), blockFor)
+		}
+		t.Logf("unblocked stream completed in %v while its sibling was stalled for %v",
+			elapsed.Round(time.Millisecond), blockFor)
+	case <-time.After(40 * time.Second):
+		t.Fatal("neither stream completed")
+	}
+}
+
+// streamBlockingPath discards every data packet belonging to one stream until a
+// deadline, leaving all other traffic untouched. Retransmissions are discarded
+// too, so the stream is genuinely stalled rather than merely delayed.
+type streamBlockingPath struct {
+	net.PacketConn
+	blockStream uint32
+	until       time.Time
+}
+
+func (c *streamBlockingPath) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if time.Now().Before(c.until) {
+		if pkt, err := UnmarshalPacket(b); err == nil &&
+			pkt.SourceStreamID == c.blockStream && isDataBearing(pkt) {
+			return len(b), nil
+		}
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// TestHandleStreamFrame_DataBeforeSynOpensTheStream pins the second thing that
+// broke when packets stopped being reordered before delivery.
+//
+// A stream used to be opened only by a frame carrying SYN, which was safe only
+// because connection-level reassembly guaranteed the SYN — the lowest sequence
+// number — was processed first. Handling frames on arrival lets a reordered
+// data packet beat it, and there was nothing to attach the bytes to: they were
+// dropped, having already been acknowledged, so the sender never re-sent them
+// and the stream stalled at that offset forever. It cost roughly one transfer
+// in four at 25% reordering, always after exactly one packet.
+func TestHandleStreamFrame_DataBeforeSynOpensTheStream(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	local, _ := NewConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	remote, _ := NewConnectionID([]byte{8, 7, 6, 5, 4, 3, 2, 1})
+	c := NewConnection(local, remote, addr, addr, false, RealClock{},
+		func([]byte, net.Addr) error { return nil })
+	c.addrValidated = true
+	t.Cleanup(func() { c.Close() })
+
+	send := func(offset uint64, payload string, syn bool) {
+		c.HandlePacket(&Packet{
+			Version:             VersionCurrent,
+			Sequence:            uint32(offset) + 1,
+			DestinationStreamID: 0, // peer has not learned our id yet
+			SourceStreamID:      7,
+			Frames:              []Frame{&StreamFrame{IsSyn: syn, Offset: offset, Data: []byte(payload)}},
+		})
+	}
+
+	// The second packet overtakes the SYN.
+	send(5, "world", false)
+	send(0, "hello", true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s, err := c.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("no stream was opened by data that arrived before the SYN: %v", err)
+	}
+
+	got, err := drain(s, len("helloworld"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("stalled: the bytes that arrived before the SYN were dropped "+
+			"after being acknowledged, so they are never re-sent: %v", err)
+	}
+	if string(got) != "helloworld" {
+		t.Fatalf("read %q, want %q", got, "helloworld")
+	}
+}
+
+// TestHandleStreamFrame_BareFinDoesNotOpenAStream is the limit on the above. A
+// FIN carries nothing to deliver, so opening a stream for one invents a stream
+// the application never had — which is what a FIN for an already-closed stream
+// would otherwise do.
+func TestHandleStreamFrame_BareFinDoesNotOpenAStream(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	local, _ := NewConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	remote, _ := NewConnectionID([]byte{8, 7, 6, 5, 4, 3, 2, 1})
+	c := NewConnection(local, remote, addr, addr, false, RealClock{},
+		func([]byte, net.Addr) error { return nil })
+	c.addrValidated = true
+	t.Cleanup(func() { c.Close() })
+
+	c.HandlePacket(&Packet{
+		Version:             VersionCurrent,
+		Sequence:            1,
+		DestinationStreamID: 0,
+		SourceStreamID:      7,
+		Frames:              []Frame{&StreamFrame{IsFin: true, Offset: 0}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if s, err := c.AcceptStream(ctx); err == nil {
+		t.Fatalf("a bare FIN opened stream %d", s.ID)
 	}
 }
