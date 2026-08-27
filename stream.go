@@ -45,14 +45,13 @@ type Stream struct {
 	sendCond      *sync.Cond
 	writeDeadline time.Time
 
-	// Receive side
-	recvBuf       []byte            // ordered data ready for reading
-	recvOOO       map[uint32][]byte // out-of-order buffer: seq -> data
-	nextExpectSeq uint32
-	recvSeqInit   bool // true after first DeliverData sets nextExpectSeq
-	recvCond      *sync.Cond
-	readDeadline  time.Time
-	finReceived   bool
+	// Receive side. Reassembly happens at the connection, not here: the
+	// sequence number is connection-wide, so a stream only ever sees a sparse
+	// subsequence of it. See Connection.HandlePacket.
+	recvBuf      []byte // ordered data ready for reading
+	recvCond     *sync.Cond
+	readDeadline time.Time
+	finReceived  bool
 
 	// Flow control
 	streamFC *StreamFlowController
@@ -81,7 +80,6 @@ func NewStream(id uint32, remoteID uint32, fc *StreamFlowController) *Stream {
 		ID:       id,
 		RemoteID: remoteID,
 		state:    StreamStateIdle,
-		recvOOO:  make(map[uint32][]byte),
 		streamFC: fc,
 	}
 	s.sendCond = sync.NewCond(&s.mu)
@@ -378,55 +376,27 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // --- Receive-side methods called by Connection ---
 
-// DeliverData delivers data to the stream's receive buffer in sequence order.
-// UDP can deliver packets out of order over real networks. If data arrives
-// out of sequence, it is buffered in recvOOO and delivered once the gap is
-// filled. This is critical for the Noise encryption layer, which uses a
-// sequential nonce counter — out-of-order bytes cause MAC failures.
-func (s *Stream) DeliverData(seq uint32, data []byte) {
+// DeliverData appends already-ordered data to the stream's receive buffer.
+//
+// Reordering is NOT done here. UDP delivers out of order and the byte stream
+// must be contiguous — the Noise layer above uses a sequential nonce counter,
+// so a single transposition causes MAC failures — but the sequence number that
+// establishes the order is allocated per *connection*, not per stream. This
+// used to reorder on that number directly, which works only while a connection
+// carries one stream: with two or more, each stream sees a sparse subsequence
+// of the shared counter, so every packet after the first waits forever for a
+// gap that belongs to a different stream. Connection.HandlePacket now holds
+// packets until they are contiguous and calls this in order.
+func (s *Stream) DeliverData(data []byte) {
 	s.mu.Lock()
 
-	// Initialize expected sequence on first data delivery
-	if !s.recvSeqInit {
-		s.nextExpectSeq = seq
-		s.recvSeqInit = true
-	}
-
-	dataLen := len(data)
-
-	if seq == s.nextExpectSeq {
-		// In-order: deliver directly
-		s.recvBuf = append(s.recvBuf, data...)
-		s.nextExpectSeq++
-
-		// Flush any contiguous OOO entries
-		for {
-			if oooData, ok := s.recvOOO[s.nextExpectSeq]; ok {
-				s.recvBuf = append(s.recvBuf, oooData...)
-				delete(s.recvOOO, s.nextExpectSeq)
-				s.nextExpectSeq++
-			} else {
-				break
-			}
-		}
-	} else if seq > s.nextExpectSeq {
-		// Out-of-order: buffer for later delivery
-		if _, exists := s.recvOOO[seq]; !exists {
-			buf := make([]byte, dataLen)
-			copy(buf, data)
-			s.recvOOO[seq] = buf
-		}
-	} else {
-		// seq < nextExpectSeq: duplicate or late arrival, drop
-		s.mu.Unlock()
-		return
-	}
+	s.recvBuf = append(s.recvBuf, data...)
 
 	// Receipt only accounts; the window reopens in Read, when the application
 	// actually consumes the bytes. Advertising on receipt would let recvBuf grow
 	// without bound against a slow reader.
 	if s.streamFC != nil {
-		s.streamFC.OnDataReceived(dataLen)
+		s.streamFC.OnDataReceived(len(data))
 	}
 
 	s.recvCond.Broadcast()

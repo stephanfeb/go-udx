@@ -103,7 +103,7 @@ func TestStream_ReadDeliverData(t *testing.T) {
 	s, _ := newTestStream(t)
 
 	// Deliver data
-	s.DeliverData(0, []byte("world"))
+	s.DeliverData([]byte("world"))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)
@@ -119,8 +119,8 @@ func TestStream_MultipleDeliveries(t *testing.T) {
 	s, _ := newTestStream(t)
 
 	// Data is delivered in arrival order (reordering handled at connection level)
-	s.DeliverData(0, []byte("A"))
-	s.DeliverData(1, []byte("B"))
+	s.DeliverData([]byte("A"))
+	s.DeliverData([]byte("B"))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)
@@ -160,7 +160,7 @@ func TestStream_FIN(t *testing.T) {
 func TestStream_ReadAfterFIN(t *testing.T) {
 	s, _ := newTestStream(t)
 
-	s.DeliverData(0, []byte("data"))
+	s.DeliverData([]byte("data"))
 	s.DeliverFin()
 
 	buf := make([]byte, 10)
@@ -261,7 +261,7 @@ func TestStream_ConcurrentReadWrite(t *testing.T) {
 	// Reader
 	go func() {
 		defer wg.Done()
-		s.DeliverData(0, []byte("response"))
+		s.DeliverData([]byte("response"))
 		buf := make([]byte, 20)
 		s.Read(buf)
 	}()

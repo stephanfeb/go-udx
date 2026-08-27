@@ -1,16 +1,27 @@
 /// Bulk-transfer Dart peer for go-udx interop tests.
 ///
 /// Modes:
-///   send      <port> <bytes>      connect to a Go server and upload <bytes>
-///   recv      <port> <bytes>      connect to a Go server and download <bytes>
-///   recvslow  <port> <ms>         download while deliberately reading slowly,
-///                                 for <ms> milliseconds, then report consumed
+///   send      <port> <bytes>            connect to a Go server and upload <bytes>
+///   recv      <port> <bytes>            connect to a Go server and download <bytes>
+///   recvslow  <port> <ms>               download while deliberately reading slowly,
+///                                       for <ms> milliseconds, then report consumed
+///   sendmulti <port> <bytes> <streams>  upload <bytes> on each of <streams>
+///                                       concurrent streams over one connection
+///   recvmulti <port> <bytes> <streams>  download <bytes> on each of <streams>
+///                                       concurrent streams over one connection
 ///
 /// Writes progress and a final "RESULT <bytes>" line to stderr so the Go side
 /// can assert on how much actually crossed. Exits non-zero on failure.
 ///
 /// The payload is the same deterministic pattern the Go tests use
 /// (byte i == (i*31 + i~/251) & 0xff) so either side can verify integrity.
+///
+/// The multi-stream modes exist because both implementations reassemble at the
+/// connection: sequence numbers are allocated per connection, so a stream sees
+/// only a sparse subsequence of them. Single-stream transfers cannot tell a
+/// correct reassembler from one that ignores ordering entirely, and cannot
+/// catch bytes delivered intact to the wrong stream. Every stream therefore
+/// carries a marker so the receiver verifies identity, not just volume.
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -26,6 +37,17 @@ Uint8List pattern(int n, int offset) {
   return b;
 }
 
+/// markedPattern stamps `marker` over every 512th byte so a receiver can tell
+/// which stream a payload belongs to. Byte 0 always carries it, which lets the
+/// receiver identify a stream from its very first chunk.
+Uint8List markedPattern(int n, int offset, int marker) {
+  final b = pattern(n, offset);
+  for (var i = 0; i < n; i++) {
+    if ((offset + i) % 512 == 0) b[i] = marker;
+  }
+  return b;
+}
+
 Future<void> main(List<String> args) async {
   if (args.length < 3) {
     stderr.writeln('usage: bulk_peer.dart <send|recv> <port> <bytes>');
@@ -34,6 +56,7 @@ Future<void> main(List<String> args) async {
   final mode = args[0];
   final port = int.parse(args[1]);
   final totalBytes = int.parse(args[2]);
+  final streamCount = args.length > 3 ? int.parse(args[3]) : 1;
 
   final rawSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
   final mux = UDXMultiplexer(rawSocket);
@@ -45,6 +68,9 @@ Future<void> main(List<String> args) async {
   await udpSocket.handshakeComplete.timeout(const Duration(seconds: 10));
   stderr.writeln('READY');
 
+  // Everything opened here, so cleanup closes all of it rather than leaking
+  // the extra streams the multi-stream modes create.
+  final allStreams = <UDXStream>[stream];
   var exitCode0 = 0;
   try {
     if (mode == 'send') {
@@ -104,6 +130,74 @@ Future<void> main(List<String> args) async {
       await sub.cancel();
       stderr.writeln('RESULT $got');
       stderr.writeln('WINDOW ${stream.receiveWindow}');
+    } else if (mode == 'sendmulti' || mode == 'recvmulti') {
+      // All streams share one connection, and therefore one sequence space.
+      // The first is already open; the rest take the remaining odd local IDs.
+      final streams = <UDXStream>[stream];
+      for (var i = 1; i < streamCount; i++) {
+        streams.add(await UDXStream.createOutgoing(
+          UDX(), udpSocket, 1 + 2 * i, 0, '127.0.0.1', port,
+        ));
+      }
+      allStreams.addAll(streams.skip(1));
+
+      var total = 0;
+      var corrupt = false;
+
+      if (mode == 'sendmulti') {
+        await Future.wait(List.generate(streams.length, (i) async {
+          const chunk = 32 * 1024;
+          var n = 0;
+          while (n < totalBytes) {
+            final len = (totalBytes - n) < chunk ? (totalBytes - n) : chunk;
+            await streams[i].add(markedPattern(len, n, i));
+            n += len;
+          }
+          total += n;
+          stderr.writeln('STREAM_DONE $i $n');
+        }));
+      } else {
+        // The receiver does not know which stream carries which payload until
+        // the first byte arrives, which is the point: identity is proven by
+        // the data, not assumed from the order streams were opened.
+        final seen = <int>{};
+        await Future.wait(streams.map((s) async {
+          var n = 0;
+          int? marker;
+          final done = Completer<void>();
+          s.data.listen((chunk) {
+            marker ??= chunk[0];
+            final expect = markedPattern(chunk.length, n, marker!);
+            for (var i = 0; i < chunk.length; i++) {
+              if (chunk[i] != expect[i]) {
+                corrupt = true;
+                break;
+              }
+            }
+            n += chunk.length;
+            if (n >= totalBytes && !done.isCompleted) done.complete();
+          }, onDone: () {
+            if (!done.isCompleted) done.complete();
+          });
+          await done.future.timeout(const Duration(seconds: 120));
+          total += n;
+          if (marker != null && !seen.add(marker!)) {
+            corrupt = true;
+            stderr.writeln('DUPLICATE_MARKER $marker');
+          }
+          stderr.writeln('STREAM_DONE $marker $n');
+        }));
+        if (seen.length != streamCount) {
+          corrupt = true;
+          stderr.writeln('MARKERS ${seen.length} want $streamCount');
+        }
+      }
+
+      stderr.writeln('RESULT $total');
+      if (corrupt) {
+        stderr.writeln('CORRUPT');
+        exitCode0 = 1;
+      }
     } else {
       stderr.writeln('unknown mode: $mode');
       exitCode0 = 2;
@@ -114,9 +208,11 @@ Future<void> main(List<String> args) async {
     exitCode0 = 1;
   }
 
-  try {
-    await stream.close();
-  } catch (_) {}
+  for (final s in allStreams) {
+    try {
+      await s.close();
+    } catch (_) {}
+  }
   mux.close();
   exit(exitCode0);
 }
