@@ -241,26 +241,20 @@ func TestTransfer_SustainedBidirectional(t *testing.T) {
 }
 
 // TestTransfer_ManyStreamsOnOneConnection covers the report's observation that
-// the ceiling tracked cumulative bytes rather than any single stream.
+// the ceiling tracked cumulative bytes rather than any single stream, and pins
+// the connection-level reassembly that makes concurrent streams work at all.
 //
-// SKIPPED: concurrent streams on one connection are broken independently of the
-// flow-control fix, and have been all along — the original code hangs on this
-// too. sendPacket allocates one connection-wide sequence number
-// (PacketManager.NextSequence), but Stream.DeliverData uses that value as a
-// per-stream ordering key and advances nextExpectSeq by one per delivery. With
-// two or more active streams each sees only a sparse subsequence of the shared
-// counter, so every packet after the first lands in recvOOO and is never
-// released. Each stream delivers exactly one packet and then stalls forever.
+// This hung indefinitely until reassembly moved to the connection. sendPacket
+// allocates one sequence per connection, but Stream.DeliverData used that value
+// as a per-stream ordering key: with two or more active streams each saw only a
+// sparse subsequence of the shared counter, so every packet after the first
+// waited forever for a gap belonging to a different stream. Each stream
+// delivered exactly one packet (1372 bytes) and then stalled.
 //
-// Fixing it requires a per-stream byte offset or sequence in StreamFrame, which
-// is a wire-format change that has to be coordinated with the Dart UDX
-// implementation. Unskip once StreamFrame carries per-stream ordering.
-//
-// This does not affect the reported bug: go-libp2p-udx-transport runs a single
-// UDX stream per connection with yamux multiplexing above it.
+// dart-udx has always reassembled at the connection (socket.dart,
+// _nextExpectedSeq + _connectionReceiveBuffer), so this is Go matching the
+// protocol as already deployed rather than a wire-format change.
 func TestTransfer_ManyStreamsOnOneConnection(t *testing.T) {
-	t.Skip("concurrent streams need per-stream sequencing in StreamFrame; see comment above")
-
 	const streams = 8
 	const perStream = 192 * 1024 // 1.5 MB total across the connection
 

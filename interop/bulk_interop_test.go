@@ -45,11 +45,17 @@ type peerResult struct {
 }
 
 // startDartPeer launches the bulk peer and reports what it managed to transfer.
-func startDartPeer(t *testing.T, ctx context.Context, mode string, port, total int) <-chan peerResult {
+// streams is optional and defaults to one; the multi-stream modes read it as
+// the number of concurrent streams to open on the single connection.
+func startDartPeer(t *testing.T, ctx context.Context, mode string, port, total int, streams ...int) <-chan peerResult {
 	t.Helper()
 
 	script := filepath.Join(dartPeerDir, "bin", "bulk_peer.dart")
-	cmd := exec.CommandContext(ctx, "dart", "run", script, mode, strconv.Itoa(port), strconv.Itoa(total))
+	argv := []string{"run", script, mode, strconv.Itoa(port), strconv.Itoa(total)}
+	if len(streams) > 0 {
+		argv = append(argv, strconv.Itoa(streams[0]))
+	}
+	cmd := exec.CommandContext(ctx, "dart", argv...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

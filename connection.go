@@ -55,13 +55,17 @@ type Connection struct {
 	pathChallenge     [8]byte
 	pathChallengeResp chan [8]byte
 
-	// Receive-side packet deduplication (keyed by seq<<32|size)
-	seenPackets  map[uint64]struct{}
-	highWaterSeq uint32
-
 	// Receive-side SACK tracking: records sequence numbers of received
 	// data-bearing packets so ACKs can include selective acknowledgment ranges.
 	recvdDataSeqs map[uint32]struct{}
+
+	// Connection-level receive ordering. Sequence numbers are allocated per
+	// connection, so this is the only layer that sees a dense run of them and
+	// therefore the only layer that can reassemble. Holds data-bearing packets
+	// that arrived ahead of a gap until the gap is filled.
+	nextExpectSeq uint32
+	recvSeqInit   bool
+	recvOOO       map[uint32]*Packet
 
 	// Anti-amplification
 	bytesSent     int64
@@ -105,8 +109,8 @@ func NewConnection(
 		maxStreams:      InitialMaxStreams,
 		incomingStreams: make(chan *Stream, 16),
 		pmtud:        NewPMTUDController(),
-		seenPackets:   make(map[uint64]struct{}),
 		recvdDataSeqs: make(map[uint32]struct{}),
+		recvOOO:       make(map[uint32]*Packet),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
@@ -473,63 +477,47 @@ func (c *Connection) retransmitPacket(pkt *SentPacket) {
 	}
 }
 
-// HandlePacket processes an incoming packet with deduplication.
-// Tracks seen packets to prevent duplicate stream data delivery,
-// which corrupts the Noise encryption layer (chacha20poly1305 MAC failures).
+// HandlePacket processes an incoming packet.
 //
-// The dedup key is (sequence, marshaledSize) because the Dart UDX
-// implementation sends genuinely different packets with the same sequence
-// number (e.g. connection SYN, stream SYN, and data all at seq=0).
-// Using sequence alone would wrongly suppress these distinct packets.
-// True retransmissions have the same sequence AND the same size.
+// Duplicate stream data must never reach a stream twice — it corrupts the Noise
+// layer above, which uses a sequential nonce counter (chacha20poly1305 MAC
+// failures). That guarantee comes from reassemble, which delivers each sequence
+// exactly once by construction.
+//
+// This used to be a separate (sequence, marshaledSize) dedupe table consulted
+// before delivery. It could not be relied on for correctness in either
+// direction: it was trimmed above 1000 entries, so a long-delayed duplicate
+// went unrecognised, and — worse — a packet recorded here but then dropped for
+// want of reassembly buffer would have its retransmission suppressed as a
+// duplicate and stall the stream permanently. Sequence order answers the
+// question exactly, so nothing is gained by asking twice.
 func (c *Connection) HandlePacket(pkt *Packet) {
-	marshaledData := MarshalPacket(pkt)
-	pktSize := uint32(len(marshaledData))
-
 	c.mu.Lock()
-	c.bytesReceived += int64(pktSize)
-
-	seq := pkt.Sequence
-	// Composite key: upper 32 bits = sequence, lower 32 bits = packet size
-	dedupeKey := uint64(seq)<<32 | uint64(pktSize)
-	seen := false
-	if _, exists := c.seenPackets[dedupeKey]; exists {
-		seen = true
-	}
-
-	if !seen {
-		c.seenPackets[dedupeKey] = struct{}{}
-		if seq > c.highWaterSeq {
-			c.highWaterSeq = seq
-		}
-		// Prevent unbounded memory growth: trim entries far below high water mark
-		if len(c.seenPackets) > 1000 {
-			threshold := uint64(c.highWaterSeq-500) << 32
-			for k := range c.seenPackets {
-				if k < threshold {
-					delete(c.seenPackets, k)
-				}
-			}
-		}
-	}
+	c.bytesReceived += int64(len(MarshalPacket(pkt)))
 	c.mu.Unlock()
 
-	// Process all frames. For true duplicates (same seq+size), skip StreamFrame
-	// data delivery to prevent corrupting the ordered byte stream, but always
-	// process control frames (ACK, WindowUpdate, Ping, etc.).
+	seq := pkt.Sequence
+
+	// Non-STREAM frames are processed on arrival, never held for reassembly.
+	// Only the byte stream needs ordering; ACKs, window updates and the rest
+	// are self-describing. Queueing them behind a gap would be actively harmful
+	// — an ACK trapped behind the very packet it reports lost cannot drive the
+	// retransmission that fills the gap, which deadlocks recovery.
 	for _, frame := range pkt.Frames {
-		if seen {
-			if sf, ok := frame.(*StreamFrame); ok {
-				if len(sf.Data) > 0 {
-					continue // Skip duplicate stream data
-				}
-				// Still process SYN/FIN flags even on duplicate seq
-			}
+		if _, ok := frame.(*StreamFrame); ok {
+			continue
 		}
 		c.handleFrame(pkt, frame)
 	}
 
+	if !isDataBearing(pkt) {
+		return
+	}
+
 	// Send ACK with SACK ranges so the remote sender can identify lost packets.
+	// This reflects *receipt*, not delivery: a packet buffered ahead of a gap is
+	// still safely held, and reporting it lets the peer retransmit only what is
+	// genuinely missing.
 	//
 	// Only data-bearing packets are acknowledged. Acknowledging control-only
 	// packets makes every ACK provoke an ACK in return, which ping-pongs
@@ -538,13 +526,75 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 	// independently — sendPacket only registers data-bearing packets with the
 	// packet manager, so an ACK for a control packet can never match anything
 	// in flight.
-	if isDataBearing(pkt) {
-		if seq > 0 {
-			c.mu.Lock()
-			c.recvdDataSeqs[seq] = struct{}{}
-			c.mu.Unlock()
+	if seq > 0 {
+		c.mu.Lock()
+		c.recvdDataSeqs[seq] = struct{}{}
+		c.mu.Unlock()
+	}
+	c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{c.buildAckFrame(seq)})
+
+	for _, ready := range c.reassemble(pkt) {
+		c.deliverStreamFrames(ready)
+	}
+}
+
+// reassemble places a data-bearing packet in connection sequence order and
+// returns the packets that are now contiguous, oldest first. Returns nil while
+// a gap remains.
+//
+// Ordering belongs here rather than in Stream because sendPacket allocates one
+// sequence per connection. A stream sees only the subsequence addressed to it,
+// which is dense only when the connection carries a single stream — the reason
+// concurrent streams stalled after exactly one packet each.
+func (c *Connection) reassemble(pkt *Packet) []*Packet {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	seq := pkt.Sequence
+
+	// The peer's first data packet establishes the baseline; it is not
+	// necessarily zero, since the handshake may consume sequences.
+	if !c.recvSeqInit {
+		c.nextExpectSeq = seq
+		c.recvSeqInit = true
+	}
+
+	if seq != c.nextExpectSeq {
+		if seq > c.nextExpectSeq {
+			if _, exists := c.recvOOO[seq]; !exists {
+				// Bound the buffer. Anything dropped here is still tracked by
+				// the peer's packet manager and will be retransmitted, so this
+				// costs throughput rather than correctness.
+				if len(c.recvOOO) < maxConnRecvOOO {
+					c.recvOOO[seq] = pkt
+				}
+			}
 		}
-		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{c.buildAckFrame(seq)})
+		// seq < nextExpectSeq is a duplicate or late arrival; already delivered.
+		return nil
+	}
+
+	ready := []*Packet{pkt}
+	c.nextExpectSeq++
+	for {
+		next, ok := c.recvOOO[c.nextExpectSeq]
+		if !ok {
+			break
+		}
+		delete(c.recvOOO, c.nextExpectSeq)
+		ready = append(ready, next)
+		c.nextExpectSeq++
+	}
+	return ready
+}
+
+// deliverStreamFrames hands a packet's STREAM frames to their streams. Called
+// only for packets released in order by reassemble.
+func (c *Connection) deliverStreamFrames(pkt *Packet) {
+	for _, frame := range pkt.Frames {
+		if sf, ok := frame.(*StreamFrame); ok {
+			c.handleStreamFrame(pkt, sf)
+		}
 	}
 }
 
@@ -751,7 +801,7 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 	}
 
 	if len(f.Data) > 0 {
-		s.DeliverData(pkt.Sequence, f.Data)
+		s.DeliverData(f.Data)
 	}
 	if f.IsFin {
 		s.DeliverFin()

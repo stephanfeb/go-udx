@@ -24,6 +24,13 @@ const (
 	// before re-checking. A lost ACK must not wedge it: the PTO timer needs a
 	// chance to retransmit and release inflight bytes.
 	sendCreditPollInterval = 5 * time.Millisecond
+
+	// maxConnRecvOOO caps how many data packets the connection holds while
+	// waiting for a gap to be filled. In-flight data is already bounded by the
+	// congestion window, so this only ever trips on a pathological peer;
+	// overflow costs a retransmission, not correctness.
+	maxConnRecvOOO = 4096
+
 	InitialMaxStreams     = 100
 	MaxAckDelay          = 25 * time.Millisecond
 	AckDelayExponent     = 3
