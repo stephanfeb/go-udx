@@ -6,6 +6,30 @@ import "time"
 const (
 	InitialMaxData       = 1024 * 1024 // 1 MB
 	InitialMaxStreamData = 65536       // 64 KB
+
+	// MaxStreamRecvWindow caps the auto-tuned per-stream receive window.
+	// The window doubles on each WINDOW_UPDATE, and an update only fires after
+	// the application has drained half a window, so a stream must actually move
+	// this many bytes before it earns the full window.
+	MaxStreamRecvWindow = 4 << 20 // 4 MB
+
+	// MaxStreamDataOffset is the largest absolute offset a WINDOW_UPDATE can
+	// carry, bounded by the frame's uint32 WindowSize field. This caps a single
+	// stream's lifetime transfer at 4GB; widening it requires a wire change
+	// coordinated with the Dart UDX implementation.
+	MaxStreamDataOffset = int64(1<<32 - 1)
+
+	// StreamBlockedRetryInterval is how often a flow-control-blocked writer
+	// re-sends STREAM_DATA_BLOCKED while waiting for credit. WINDOW_UPDATE and
+	// STREAM_DATA_BLOCKED both ride seq=0 control packets that are never
+	// retransmitted, so this retry is the only thing that recovers a stream
+	// whose window update was dropped.
+	StreamBlockedRetryInterval = 500 * time.Millisecond
+
+	// sendCreditPollInterval bounds how long a congestion-limited writer parks
+	// before re-checking. A lost ACK must not wedge it: the PTO timer needs a
+	// chance to retransmit and release inflight bytes.
+	sendCreditPollInterval = 5 * time.Millisecond
 	InitialMaxStreams     = 100
 	MaxAckDelay          = 25 * time.Millisecond
 	AckDelayExponent     = 3

@@ -31,8 +31,14 @@ func TestPacketManager_SendAndAck(t *testing.T) {
 		FirstAckRangeLength: 1,
 	})
 
-	if len(acked) != 1 || acked[0] != seq {
+	if len(acked) != 1 || acked[0].Sequence != seq {
 		t.Fatalf("acked: got %v, want [%d]", acked, seq)
+	}
+	// The acked packet must come back with its size and send time intact: the
+	// congestion controller needs both, and they are unrecoverable once the
+	// entry is deleted from the manager.
+	if acked[0].Size != 1000 {
+		t.Fatalf("acked packet size: got %d, want 1000", acked[0].Size)
 	}
 	if pm.PendingCount() != 0 {
 		t.Fatalf("pending after ack: got %d, want 0", pm.PendingCount())

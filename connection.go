@@ -74,6 +74,11 @@ type Connection struct {
 	// Cleanup callback (set by multiplexer to remove from connection map)
 	onClose func()
 
+	// Send-credit signalling: writers park here when the congestion window or
+	// pacer is closed, and handleAckFrame wakes them.
+	sendCreditMu sync.Mutex
+	sendCredit   *sync.Cond
+
 	// Close
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -106,6 +111,8 @@ func NewConnection(
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
 	}
+
+	c.sendCredit = sync.NewCond(&c.sendCreditMu)
 
 	c.cc = NewCongestionController(clk, func() int {
 		c.mu.Lock()
@@ -204,6 +211,10 @@ func (c *Connection) CloseWithError(code uint32, reason string) error {
 			s.DeliverReset(code)
 		}
 
+		c.sendCreditMu.Lock()
+		c.sendCredit.Broadcast()
+		c.sendCreditMu.Unlock()
+
 		c.cc.Destroy()
 		c.pm.Destroy()
 
@@ -253,9 +264,63 @@ func (c *Connection) sendResetStream(streamID, remoteID uint32, errorCode uint32
 	c.sendPacket(remoteID, streamID, []Frame{frame})
 }
 
-func (c *Connection) sendWindowUpdate(streamID, remoteID uint32, windowSize int) {
-	frame := &WindowUpdateFrame{WindowSize: uint32(windowSize)}
+// sendWindowUpdate advertises an ABSOLUTE offset limit for the stream: the
+// highest cumulative byte position the peer may send. It is not a window size.
+// See StreamFlowController for why absolute offsets are required here.
+func (c *Connection) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int) {
+	frame := &WindowUpdateFrame{WindowSize: uint32(maxStreamData)}
 	c.sendPacket(remoteID, streamID, []Frame{frame})
+}
+
+// sendStreamDataBlocked tells the peer we have run out of send credit on this
+// stream at the given offset, prompting it to re-advertise its limit.
+func (c *Connection) sendStreamDataBlocked(streamID, remoteID uint32, limit int64) {
+	frame := &StreamDataBlockedFrame{StreamID: streamID, MaxStreamData: uint64(limit)}
+	c.sendPacket(remoteID, streamID, []Frame{frame})
+}
+
+// awaitSendCredit blocks until the congestion window and pacer allow another
+// packet of the given size, the write deadline passes, or the connection
+// closes. Returns false if the caller should stop trying.
+//
+// Nothing used to gate the send path on the congestion window at all: cwnd,
+// CUBIC and the pacer were all implemented but unreachable, so a writer emitted
+// packets as fast as flow control allowed. That was invisible only because the
+// stream window capped every transfer at ~256KB; once that ceiling was lifted a
+// sender would dump megabytes into the socket at once and drown itself in loss.
+func (c *Connection) awaitSendCredit(size int, deadline time.Time) bool {
+	c.sendCreditMu.Lock()
+	defer c.sendCreditMu.Unlock()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return false
+		default:
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return false
+		}
+
+		wait := c.cc.Pacer.TimeUntilSend()
+		if wait <= 0 && c.cc.CanSend(size) {
+			return true
+		}
+		if wait <= 0 || wait > sendCreditPollInterval {
+			// Either we are cwnd-limited (woken by handleAckFrame) or the pacer
+			// wants longer than one poll. Cap the sleep so a lost ACK cannot
+			// wedge the writer: the PTO timer will retransmit and free inflight.
+			wait = sendCreditPollInterval
+		}
+
+		timer := time.AfterFunc(wait, func() {
+			c.sendCreditMu.Lock()
+			defer c.sendCreditMu.Unlock()
+			c.sendCredit.Broadcast()
+		})
+		c.sendCredit.Wait()
+		timer.Stop()
+	}
 }
 
 func (c *Connection) clock() Clock { return c.clk }
@@ -282,6 +347,20 @@ func (c *Connection) findStream(localID, remoteID uint32) *Stream {
 }
 
 // --- Packet handling ---
+
+// isDataBearing reports whether a packet carries stream data or a stream
+// lifecycle flag, i.e. whether it consumed a sequence number and is tracked by
+// the packet manager. Mirrors the hasData test in sendPacket.
+func isDataBearing(pkt *Packet) bool {
+	for _, f := range pkt.Frames {
+		if sf, ok := f.(*StreamFrame); ok {
+			if len(sf.Data) > 0 || sf.IsSyn || sf.IsFin {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame) {
 	// Determine if this packet carries data (stream frames with data/SYN/FIN).
@@ -333,8 +412,12 @@ func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame)
 			SourceStreamID:      srcStreamID,
 		}
 		c.pm.SendPacket(sentPkt)
+		// Only data-bearing packets enter the congestion controller's inflight
+		// accounting. Control packets (ACKs, window updates) are never
+		// acknowledged, so counting them would inflate inflight monotonically
+		// until nothing could be sent.
+		c.cc.OnPacketSent(len(data))
 	}
-	c.cc.OnPacketSent(len(data))
 
 	// Anti-amplification check
 	c.mu.Lock()
@@ -372,7 +455,10 @@ func (c *Connection) retransmitPacket(pkt *SentPacket) {
 	}
 
 	data := MarshalPacket(rePkt)
-	c.cc.OnPacketSent(len(data))
+
+	// No OnPacketSent here: the original transmission is still counted in
+	// inflight and this packet keeps its original sequence number, so counting
+	// it again would double-charge the congestion window for one packet.
 
 	c.mu.Lock()
 	c.bytesSent += int64(len(data))
@@ -439,8 +525,16 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		c.handleFrame(pkt, frame)
 	}
 
-	// Send ACK with SACK ranges so the remote sender can identify lost packets
-	if pkt.SourceStreamID != 0 || pkt.DestinationStreamID != 0 {
+	// Send ACK with SACK ranges so the remote sender can identify lost packets.
+	//
+	// Only data-bearing packets are acknowledged. Acknowledging control-only
+	// packets makes every ACK provoke an ACK in return, which ping-pongs
+	// without end: a 64KB transfer measured ~176,000 ack-only datagrams for 48
+	// data packets before this guard existed. It is also the correct rule
+	// independently — sendPacket only registers data-bearing packets with the
+	// packet manager, so an ACK for a control packet can never match anything
+	// in flight.
+	if isDataBearing(pkt) {
 		if seq > 0 {
 			c.mu.Lock()
 			c.recvdDataSeqs[seq] = struct{}{}
@@ -596,11 +690,14 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 		// Peer is blocked at connection level; send MAX_DATA
 		c.sendFrames([]Frame{&MaxDataFrame{MaxData: uint64(c.fc.ConnMaxData())}})
 	case *StreamDataBlockedFrame:
-		// Peer stream is blocked; send WINDOW_UPDATE with current receive window
+		// The peer is out of send credit. Re-advertise our current limit without
+		// growing the window: the peer is either missing a dropped WINDOW_UPDATE
+		// (which this repairs, since the offset is idempotent) or genuinely
+		// waiting on our application to consume. Growing here would let a peer
+		// inflate our receive buffer just by claiming to be blocked.
 		if s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID); s != nil {
 			if s.streamFC != nil {
-				newWindow := s.streamFC.GrowRecvWindow()
-				c.sendWindowUpdate(s.ID, s.RemoteID, int(newWindow))
+				c.sendWindowUpdate(s.ID, s.RemoteID, int(s.streamFC.RefreshLimit()))
 			}
 		}
 	}
@@ -659,12 +756,16 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 
 func (c *Connection) handleAckFrame(f *AckFrame) {
 	acked := c.pm.HandleAckFrame(f)
-	for _, seq := range acked {
-		// Notify congestion controller
-		if pkt := c.pm.GetPacket(seq); pkt != nil {
-			c.cc.OnPacketAcked(pkt.Size, pkt.SentTime, time.Duration(f.AckDelay)*time.Millisecond,
-				true, int(f.LargestAcked))
-		}
+	for _, pkt := range acked {
+		// Only the largest newly-acked packet yields an RTT sample and drives
+		// the window increase (RFC 9002 section 5.1); the rest just release
+		// their inflight bytes.
+		isLargest := pkt.Sequence == f.LargestAcked
+		c.cc.OnPacketAcked(pkt.Size, pkt.SentTime, time.Duration(f.AckDelay)*time.Millisecond,
+			isLargest, int(f.LargestAcked))
+	}
+	if len(acked) > 0 {
+		c.sendCredit.Broadcast()
 	}
 
 	// SACK-based loss detection: retransmit packets that fall within gaps.

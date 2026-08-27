@@ -98,11 +98,19 @@ func (pm *PacketManager) SendPacket(pkt *SentPacket) {
 }
 
 // HandleAckFrame processes an ACK frame and returns newly acknowledged sequence numbers.
-func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []uint32 {
+// HandleAckFrame processes an ACK and returns the packets it newly acknowledged.
+//
+// It returns the *SentPacket values rather than bare sequence numbers because
+// the entries are deleted here: callers previously took the sequences and then
+// asked GetPacket for the size and send time, which always came back nil. That
+// silently starved the congestion controller of every ACK it should have seen —
+// inflight only ever grew, cwnd never left its initial value, and no RTT sample
+// was ever taken.
+func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	var acked []uint32
+	var acked []*SentPacket
 
 	// Process first range: largestAcked down to largestAcked - firstAckRangeLength + 1
 	if frame.FirstAckRangeLength > 0 {
@@ -116,7 +124,7 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []uint32 {
 					delete(pm.retransmitTimers, seq)
 				}
 				delete(pm.retransmitAttempts, seq)
-				acked = append(acked, seq)
+				acked = append(acked, pkt)
 			}
 		}
 	}
@@ -135,7 +143,7 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []uint32 {
 					delete(pm.retransmitTimers, seq)
 				}
 				delete(pm.retransmitAttempts, seq)
-				acked = append(acked, seq)
+				acked = append(acked, pkt)
 			}
 		}
 		currentSeq = rangeEnd - int64(r.AckRangeLength) - 1 + 1 - 1

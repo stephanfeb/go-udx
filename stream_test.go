@@ -13,6 +13,7 @@ type mockStreamConn struct {
 	sent          []mockSentFrame
 	resets        []mockReset
 	windowUpdates []mockWindowUpdate
+	blocked       []mockBlocked
 	clk           Clock
 }
 
@@ -29,7 +30,12 @@ type mockReset struct {
 
 type mockWindowUpdate struct {
 	streamID, remoteID uint32
-	windowSize         int
+	maxStreamData      int
+}
+
+type mockBlocked struct {
+	streamID, remoteID uint32
+	limit              int64
 }
 
 func (m *mockStreamConn) sendStreamFrame(streamID, remoteID uint32, data []byte, isFin, isSyn bool) {
@@ -46,11 +52,19 @@ func (m *mockStreamConn) sendResetStream(streamID, remoteID uint32, errorCode ui
 	m.resets = append(m.resets, mockReset{streamID, remoteID, errorCode})
 }
 
-func (m *mockStreamConn) sendWindowUpdate(streamID, remoteID uint32, windowSize int) {
+func (m *mockStreamConn) sendWindowUpdate(streamID, remoteID uint32, maxStreamData int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.windowUpdates = append(m.windowUpdates, mockWindowUpdate{streamID, remoteID, windowSize})
+	m.windowUpdates = append(m.windowUpdates, mockWindowUpdate{streamID, remoteID, maxStreamData})
 }
+
+func (m *mockStreamConn) sendStreamDataBlocked(streamID, remoteID uint32, limit int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blocked = append(m.blocked, mockBlocked{streamID, remoteID, limit})
+}
+
+func (m *mockStreamConn) awaitSendCredit(size int, deadline time.Time) bool { return true }
 
 func (m *mockStreamConn) clock() Clock { return m.clk }
 
