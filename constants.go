@@ -158,3 +158,45 @@ const (
 	// had time to answer.
 	MaxRetransmitBackoff = 2 * time.Second
 )
+
+// Loss detection thresholds, RFC 9002 section 6.1.
+//
+// A gap in the acknowledged sequence numbers does not mean loss. UDP reorders,
+// and a packet that arrives late still arrives. Loss detection used to treat
+// every gap as loss on sight; a packet is now only declared lost once it is far
+// enough behind the largest acknowledged packet, or old enough, that reordering
+// can no longer explain it.
+//
+// Do not expect these to pay for themselves in throughput. They were added on
+// the theory that mistaking reordering for loss was expensive, and measurement
+// did not bear that out: against loss_detection_test.go the retransmission rate
+// moved by less than a point at every displacement from 200us to 5ms, and at
+// every reordering rate from 2% to 20%. The reason is that kPacketThreshold
+// tolerates three packets of displacement, and on a fast link even a
+// sub-millisecond delay displaces far more than three, so the threshold is
+// exceeded and the packet is declared lost anyway.
+//
+// They are here because declaring every gap lost on sight is wrong in
+// principle and diverges from the RFC this transport otherwise follows, not
+// because they were observed to help.
+const (
+	// LossReorderThreshold is kPacketThreshold: how many sequence numbers a
+	// packet must trail the largest acknowledged one before a gap counts as
+	// loss. RFC 9002 recommends 3, which tolerates the reordering seen on real
+	// paths without meaningfully delaying recovery.
+	LossReorderThreshold = 3
+
+	// LossTimeThresholdNumerator and LossTimeThresholdDenominator express
+	// kTimeThreshold, 9/8, as a fraction to keep the arithmetic in integers.
+	// Applied to the larger of the smoothed and latest RTT, this is the other
+	// way a packet qualifies as lost: too old to still be in flight, even if
+	// fewer than LossReorderThreshold packets have been acknowledged past it.
+	LossTimeThresholdNumerator   = 9
+	LossTimeThresholdDenominator = 8
+
+	// LossTimerGranularity is kGranularity, the floor on the time threshold. It
+	// keeps a near-zero RTT estimate — loopback, or before the first sample —
+	// from making the time threshold fire instantly and undo the packet
+	// threshold.
+	LossTimerGranularity = time.Millisecond
+)

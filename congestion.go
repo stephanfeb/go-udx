@@ -108,6 +108,16 @@ func (cc *CongestionController) RttVar() time.Duration {
 	return cc.rttVar
 }
 
+// LatestRtt returns the most recent RTT sample. Loss detection needs it
+// alongside the smoothed value: after a sudden increase in delay the smoothed
+// estimate lags, and using it alone would declare packets lost that are simply
+// taking longer than they used to (RFC 9002 section 6.1.2).
+func (cc *CongestionController) LatestRtt() time.Duration {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.latestRtt
+}
+
 // MinRtt returns the minimum observed RTT.
 func (cc *CongestionController) MinRtt() time.Duration {
 	cc.mu.Lock()
