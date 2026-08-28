@@ -92,7 +92,7 @@ func main() {
 }
 ```
 
-## Wire Format (v2)
+## Wire Format (v3)
 
 ```
 ┌──────────┬────────────┬────────┬────────────┬────────┬─────────┬──────────────┬──────────────┬────────┐
@@ -100,6 +100,24 @@ func main() {
 │ 4 bytes  │ 1 byte     │ var    │ 1 byte     │ var    │ 4 bytes │ 4 bytes      │ 4 bytes      │ var    │
 └──────────┴────────────┴────────┴────────────┴────────┴─────────┴──────────────┴──────────────┴────────┘
 ```
+
+The packet sequence number drives acknowledgment and loss recovery only. Data is
+ordered by the byte offset in each STREAM frame, so a gap on one stream does not
+delay another sharing the connection.
+
+```
+STREAM frame
+┌──────────┬─────────┬──────────┬───────────┬────────┐
+│ Type     │ Flags   │ Offset   │ DataLen   │ Data   │
+│ 1 byte   │ 1 byte  │ 8 bytes  │ 2 bytes   │ var    │
+└──────────┴─────────┴──────────┴───────────┴────────┘
+```
+
+**v3 is not compatible with v2.** The offset occupies the bytes a v2 parser
+reads as the data length, so a v2 peer does not reject a v3 frame — it accepts a
+plausible wrong length and delivers corrupt data. Packets carrying an
+unsupported version are therefore dropped, which makes a mismatch present as an
+unreachable peer. Upgrading requires both ends to move together.
 
 ## Architecture
 
@@ -126,7 +144,7 @@ version.go          Protocol version negotiation
 
 | Frame | Description |
 |-------|-------------|
-| STREAM | Data transfer with SYN/FIN flags |
+| STREAM | Data transfer, carrying its byte offset in the stream, with SYN/FIN flags. On FIN the offset is the stream's final size. |
 | ACK | Acknowledgment with SACK ranges |
 | WINDOW_UPDATE | Per-stream flow control |
 | MAX_DATA | Connection-level flow control |
@@ -140,6 +158,12 @@ version.go          Protocol version negotiation
 | MTU_PROBE | PMTUD probing |
 | DATA_BLOCKED / STREAM_DATA_BLOCKED | Flow control signaling |
 | PADDING | Packet padding |
+
+## Known gaps
+
+`doc/PENDING_WORK.md` records what this transport does not do: where it diverges
+from the RFCs it otherwise follows, which limitations are deliberate, and what
+closing each would involve.
 
 ## Interoperability
 
