@@ -19,6 +19,7 @@ type mockStreamConn struct {
 
 type mockSentFrame struct {
 	streamID, remoteID uint32
+	offset             uint64
 	data               []byte
 	isFin, isSyn       bool
 }
@@ -38,12 +39,12 @@ type mockBlocked struct {
 	limit              int64
 }
 
-func (m *mockStreamConn) sendStreamFrame(streamID, remoteID uint32, data []byte, isFin, isSyn bool) {
+func (m *mockStreamConn) sendStreamFrame(streamID, remoteID uint32, offset uint64, data []byte, isFin, isSyn bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d := make([]byte, len(data))
 	copy(d, data)
-	m.sent = append(m.sent, mockSentFrame{streamID, remoteID, d, isFin, isSyn})
+	m.sent = append(m.sent, mockSentFrame{streamID, remoteID, offset, d, isFin, isSyn})
 }
 
 func (m *mockStreamConn) sendResetStream(streamID, remoteID uint32, errorCode uint32) {
@@ -103,7 +104,7 @@ func TestStream_ReadDeliverData(t *testing.T) {
 	s, _ := newTestStream(t)
 
 	// Deliver data
-	s.DeliverData([]byte("world"))
+	s.DeliverData(0, []byte("world"))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)
@@ -119,8 +120,8 @@ func TestStream_MultipleDeliveries(t *testing.T) {
 	s, _ := newTestStream(t)
 
 	// Data is delivered in arrival order (reordering handled at connection level)
-	s.DeliverData([]byte("A"))
-	s.DeliverData([]byte("B"))
+	s.DeliverData(0, []byte("A"))
+	s.DeliverData(1, []byte("B"))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)
@@ -150,8 +151,8 @@ func TestStream_FIN(t *testing.T) {
 		t.Fatalf("state: got %d, want HalfClosedLocal", s.State())
 	}
 
-	// Deliver remote FIN
-	s.DeliverFin()
+	// Deliver remote FIN. Nothing was received, so the stream ends at 0.
+	s.DeliverFin(0)
 	if s.State() != StreamStateClosed {
 		t.Fatalf("state: got %d, want Closed", s.State())
 	}
@@ -160,8 +161,8 @@ func TestStream_FIN(t *testing.T) {
 func TestStream_ReadAfterFIN(t *testing.T) {
 	s, _ := newTestStream(t)
 
-	s.DeliverData([]byte("data"))
-	s.DeliverFin()
+	s.DeliverData(0, []byte("data"))
+	s.DeliverFin(uint64(len("data")))
 
 	buf := make([]byte, 10)
 	n, err := s.Read(buf)
@@ -261,7 +262,7 @@ func TestStream_ConcurrentReadWrite(t *testing.T) {
 	// Reader
 	go func() {
 		defer wg.Done()
-		s.DeliverData([]byte("response"))
+		s.DeliverData(0, []byte("response"))
 		buf := make([]byte, 20)
 		s.Read(buf)
 	}()

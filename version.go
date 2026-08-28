@@ -6,7 +6,11 @@ import (
 )
 
 // SupportedVersions lists all supported versions in preference order.
-var SupportedVersions = []uint32{VersionV2, VersionV1}
+//
+// V1 and V2 remain listed for version negotiation, which reports what this
+// build could speak. They are not accepted on the data path: V3 changed the
+// STREAM frame layout and this implementation only parses the V3 form.
+var SupportedVersions = []uint32{VersionV3, VersionV2, VersionV1}
 
 // IsVersionSupported checks if a version is supported.
 func IsVersionSupported(version uint32) bool {

@@ -168,7 +168,7 @@ func TestCongestion_RetransmitDoesNotDoubleCountInflight(t *testing.T) {
 	c.mu.Unlock()
 	defer c.Close()
 
-	c.sendStreamFrame(1, 2, make([]byte, 1000), false, false)
+	c.sendStreamFrame(1, 2, 0, make([]byte, 1000), false, false)
 	afterSend := c.cc.Inflight()
 	if afterSend == 0 {
 		t.Fatal("a data packet did not register any inflight bytes")

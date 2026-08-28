@@ -26,7 +26,7 @@ func TestStream_ReadDrivesWindowUpdates(t *testing.T) {
 	// Deliver a full window without reading any of it.
 	chunk := make([]byte, 1024)
 	for i := 0; i < 4; i++ {
-		s.DeliverData(chunk)
+		s.DeliverData(uint64(i*len(chunk)), chunk)
 	}
 
 	mc.mu.Lock()

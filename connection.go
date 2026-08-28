@@ -59,14 +59,6 @@ type Connection struct {
 	// data-bearing packets so ACKs can include selective acknowledgment ranges.
 	recvdDataSeqs map[uint32]struct{}
 
-	// Connection-level receive ordering. Sequence numbers are allocated per
-	// connection, so this is the only layer that sees a dense run of them and
-	// therefore the only layer that can reassemble. Holds data-bearing packets
-	// that arrived ahead of a gap until the gap is filled.
-	nextExpectSeq uint32
-	recvSeqInit   bool
-	recvOOO       map[uint32]*Packet
-
 	// Anti-amplification
 	bytesSent     int64
 	bytesReceived int64
@@ -110,7 +102,6 @@ func NewConnection(
 		incomingStreams: make(chan *Stream, 16),
 		pmtud:        NewPMTUDController(),
 		recvdDataSeqs: make(map[uint32]struct{}),
-		recvOOO:       make(map[uint32]*Packet),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:       sendFunc,
 		closeCh:        make(chan struct{}),
@@ -253,11 +244,12 @@ func (c *Connection) State() ConnectionState {
 
 // --- streamConn interface ---
 
-func (c *Connection) sendStreamFrame(streamID, remoteID uint32, data []byte, isFin, isSyn bool) {
+func (c *Connection) sendStreamFrame(streamID, remoteID uint32, offset uint64, data []byte, isFin, isSyn bool) {
 	frame := &StreamFrame{
-		IsFin: isFin,
-		IsSyn: isSyn,
-		Data:  data,
+		IsFin:  isFin,
+		IsSyn:  isSyn,
+		Offset: offset,
+		Data:   data,
 	}
 	// DstStreamID = remote's stream ID, SrcStreamID = our local stream ID
 	c.sendPacket(remoteID, streamID, []Frame{frame})
@@ -506,16 +498,17 @@ func (c *Connection) retransmitPacket(pkt *SentPacket) {
 //
 // Duplicate stream data must never reach a stream twice — it corrupts the Noise
 // layer above, which uses a sequential nonce counter (chacha20poly1305 MAC
-// failures). That guarantee comes from reassemble, which delivers each sequence
-// exactly once by construction.
+// failures). That guarantee comes from the byte offsets: Stream.placeLocked
+// discards anything already delivered, so a retransmission is harmless however
+// often it arrives.
 //
 // This used to be a separate (sequence, marshaledSize) dedupe table consulted
 // before delivery. It could not be relied on for correctness in either
 // direction: it was trimmed above 1000 entries, so a long-delayed duplicate
 // went unrecognised, and — worse — a packet recorded here but then dropped for
-// want of reassembly buffer would have its retransmission suppressed as a
-// duplicate and stall the stream permanently. Sequence order answers the
-// question exactly, so nothing is gained by asking twice.
+// want of buffer would have its retransmission suppressed as a duplicate and
+// stall the stream permanently. The offsets answer the question exactly, so
+// nothing is gained by asking twice.
 func (c *Connection) HandlePacket(pkt *Packet) {
 	c.mu.Lock()
 	c.bytesReceived += int64(len(MarshalPacket(pkt)))
@@ -523,15 +516,11 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 
 	seq := pkt.Sequence
 
-	// Non-STREAM frames are processed on arrival, never held for reassembly.
-	// Only the byte stream needs ordering; ACKs, window updates and the rest
-	// are self-describing. Queueing them behind a gap would be actively harmful
-	// — an ACK trapped behind the very packet it reports lost cannot drive the
-	// retransmission that fills the gap, which deadlocks recovery.
+	// Every frame is handled on arrival. Nothing is queued waiting for an
+	// earlier packet: STREAM frames carry their own offset, so a stream places
+	// its bytes itself and is held up only by its own gaps, and the other frame
+	// types were never ordered to begin with.
 	for _, frame := range pkt.Frames {
-		if _, ok := frame.(*StreamFrame); ok {
-			continue
-		}
 		c.handleFrame(pkt, frame)
 	}
 
@@ -557,70 +546,6 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		c.mu.Unlock()
 	}
 	c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{c.buildAckFrame(seq)})
-
-	for _, ready := range c.reassemble(pkt) {
-		c.deliverStreamFrames(ready)
-	}
-}
-
-// reassemble places a data-bearing packet in connection sequence order and
-// returns the packets that are now contiguous, oldest first. Returns nil while
-// a gap remains.
-//
-// Ordering belongs here rather than in Stream because sendPacket allocates one
-// sequence per connection. A stream sees only the subsequence addressed to it,
-// which is dense only when the connection carries a single stream — the reason
-// concurrent streams stalled after exactly one packet each.
-func (c *Connection) reassemble(pkt *Packet) []*Packet {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	seq := pkt.Sequence
-
-	// The peer's first data packet establishes the baseline; it is not
-	// necessarily zero, since the handshake may consume sequences.
-	if !c.recvSeqInit {
-		c.nextExpectSeq = seq
-		c.recvSeqInit = true
-	}
-
-	if seq != c.nextExpectSeq {
-		if seq > c.nextExpectSeq {
-			if _, exists := c.recvOOO[seq]; !exists {
-				// Bound the buffer. Anything dropped here is still tracked by
-				// the peer's packet manager and will be retransmitted, so this
-				// costs throughput rather than correctness.
-				if len(c.recvOOO) < maxConnRecvOOO {
-					c.recvOOO[seq] = pkt
-				}
-			}
-		}
-		// seq < nextExpectSeq is a duplicate or late arrival; already delivered.
-		return nil
-	}
-
-	ready := []*Packet{pkt}
-	c.nextExpectSeq++
-	for {
-		next, ok := c.recvOOO[c.nextExpectSeq]
-		if !ok {
-			break
-		}
-		delete(c.recvOOO, c.nextExpectSeq)
-		ready = append(ready, next)
-		c.nextExpectSeq++
-	}
-	return ready
-}
-
-// deliverStreamFrames hands a packet's STREAM frames to their streams. Called
-// only for packets released in order by reassemble.
-func (c *Connection) deliverStreamFrames(pkt *Packet) {
-	for _, frame := range pkt.Frames {
-		if sf, ok := frame.(*StreamFrame); ok {
-			c.handleStreamFrame(pkt, sf)
-		}
-	}
 }
 
 // buildAckFrame constructs an AckFrame with SACK ranges from received data
@@ -801,8 +726,21 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 			}
 		}
 	}
-	if !ok && f.IsSyn && remoteStreamID != 0 {
-		// Incoming stream — assign a new local ID, use remote's ID as RemoteID
+	if !ok && remoteStreamID != 0 && (f.IsSyn || len(f.Data) > 0) {
+		// Incoming stream — assign a new local ID, use remote's ID as RemoteID.
+		//
+		// Data opens the stream too, not just SYN. Requiring SYN was safe only
+		// while the connection reordered packets before delivery, which
+		// guaranteed the SYN — the lowest sequence number — was seen first.
+		// Once frames are handled on arrival a reordered data packet can beat
+		// it, and there was nothing to attach the bytes to: they were dropped,
+		// having already been acknowledged, so the sender never re-sent them and
+		// the stream stalled at that offset forever. Under 25% reordering that
+		// killed roughly one transfer in four, always after exactly one packet.
+		//
+		// A bare FIN or RESET is deliberately not enough. It carries nothing to
+		// deliver, so opening a stream for one only invents a stream the
+		// application never had.
 		id := c.nextStreamID
 		c.nextStreamID += 2
 
@@ -826,10 +764,12 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 	}
 
 	if len(f.Data) > 0 {
-		s.DeliverData(f.Data)
+		s.DeliverData(f.Offset, f.Data)
 	}
 	if f.IsFin {
-		s.DeliverFin()
+		// The stream ends one past this frame's last byte, which is the frame's
+		// own offset when the FIN carries no data of its own.
+		s.DeliverFin(f.Offset + uint64(len(f.Data)))
 	}
 }
 

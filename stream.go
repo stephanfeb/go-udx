@@ -45,13 +45,27 @@ type Stream struct {
 	sendCond      *sync.Cond
 	writeDeadline time.Time
 
-	// Receive side. Reassembly happens at the connection, not here: the
-	// sequence number is connection-wide, so a stream only ever sees a sparse
-	// subsequence of it. See Connection.HandlePacket.
-	recvBuf      []byte // ordered data ready for reading
-	recvCond     *sync.Cond
-	readDeadline time.Time
-	finReceived  bool
+	// Receive side. Reassembly is per stream, on the byte offsets carried in
+	// STREAM frames, so a stream is delayed only by its own missing data and
+	// never by a sibling's.
+	recvBuf    []byte            // contiguous data ready for reading
+	recvOOO    map[uint64][]byte // arrived early: offset -> bytes
+	recvOffset uint64            // total bytes moved into recvBuf so far
+	oooBytes   int               // bytes held in recvOOO, to bound it
+
+	// flowControlViolation is set when the peer overruns the out-of-order
+	// backstop. Acted on outside the lock, since resetting takes the
+	// connection's.
+	flowControlViolation bool
+	recvCond             *sync.Cond
+	readDeadline         time.Time
+
+	// finReceived means the peer has sent everything; finalSize is where the
+	// stream ends. A FIN can overtake data still in flight, so the stream is
+	// only really finished once recvOffset reaches finalSize.
+	finReceived bool
+	finSeen     bool
+	finalSize   uint64
 
 	// Flow control
 	streamFC *StreamFlowController
@@ -66,7 +80,7 @@ type Stream struct {
 
 // streamConn is the interface a stream needs from its parent connection.
 type streamConn interface {
-	sendStreamFrame(streamID uint32, remoteID uint32, data []byte, isFin bool, isSyn bool)
+	sendStreamFrame(streamID uint32, remoteID uint32, offset uint64, data []byte, isFin bool, isSyn bool)
 	sendResetStream(streamID uint32, remoteID uint32, errorCode uint32)
 	sendWindowUpdate(streamID uint32, remoteID uint32, maxStreamData int64)
 	sendStreamDataBlocked(streamID uint32, remoteID uint32, limit int64)
@@ -80,6 +94,7 @@ func NewStream(id uint32, remoteID uint32, fc *StreamFlowController) *Stream {
 		ID:       id,
 		RemoteID: remoteID,
 		state:    StreamStateIdle,
+		recvOOO:  make(map[uint64][]byte),
 		streamFC: fc,
 	}
 	s.sendCond = sync.NewCond(&s.mu)
@@ -281,12 +296,15 @@ func (s *Stream) Write(p []byte) (int, error) {
 			s.streamFC.OnDataSent(chunkSize)
 		}
 
+		// The chunk's position in the stream is where the write had reached
+		// before it, which is what the peer reassembles on.
+		offset := uint64(s.BytesWritten)
 		s.BytesWritten += int64(chunkSize)
 		s.mu.Unlock()
 
 		// Send without holding s.mu to avoid deadlock with c.mu
 		if conn != nil {
-			conn.sendStreamFrame(id, remoteID, chunk, false, isSyn)
+			conn.sendStreamFrame(id, remoteID, offset, chunk, false, isSyn)
 		}
 
 		data = data[chunkSize:]
@@ -316,12 +334,17 @@ func (s *Stream) Close() error {
 
 	conn := s.conn
 	id, remoteID := s.ID, s.RemoteID
+	// A FIN carries no data, so its offset is the stream's final size. The
+	// receiver needs that to know when it has everything: a FIN can overtake
+	// data that is still in flight, and closing the stream on its arrival
+	// alone would truncate the tail.
+	finalSize := uint64(s.BytesWritten)
 	s.recvCond.Broadcast()
 	s.mu.Unlock()
 
 	// Send FIN without holding s.mu to avoid deadlock with c.mu
 	if conn != nil {
-		conn.sendStreamFrame(id, remoteID, nil, true, false)
+		conn.sendStreamFrame(id, remoteID, finalSize, nil, true, false)
 	}
 	return nil
 }
@@ -387,34 +410,128 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // of the shared counter, so every packet after the first waits forever for a
 // gap that belongs to a different stream. Connection.HandlePacket now holds
 // packets until they are contiguous and calls this in order.
-func (s *Stream) DeliverData(data []byte) {
+func (s *Stream) DeliverData(offset uint64, data []byte) {
 	s.mu.Lock()
 
-	s.recvBuf = append(s.recvBuf, data...)
-
-	// Receipt only accounts; the window reopens in Read, when the application
-	// actually consumes the bytes. Advertising on receipt would let recvBuf grow
-	// without bound against a slow reader.
-	if s.streamFC != nil {
-		s.streamFC.OnDataReceived(len(data))
+	accepted := s.placeLocked(offset, data)
+	if s.flowControlViolation {
+		s.mu.Unlock()
+		// The peer sent more unorderable data than any window permits. Those
+		// bytes are gone and the stream can never complete, so fail it loudly
+		// instead of waiting on an offset that will never be filled.
+		s.Reset(ErrorFlowControlError)
+		return
 	}
-
-	s.recvCond.Broadcast()
+	if accepted > 0 {
+		// Receipt only accounts; the window reopens in Read, when the
+		// application actually consumes the bytes. Advertising on receipt would
+		// let the receive buffer grow without bound against a slow reader.
+		// Bytes waiting out of order count too — they are held either way.
+		if s.streamFC != nil {
+			s.streamFC.OnDataReceived(accepted)
+		}
+		s.finishLocked()
+		s.recvCond.Broadcast()
+	}
 	s.mu.Unlock()
 }
 
-// DeliverFin marks the remote side as closed.
-func (s *Stream) DeliverFin() {
+// placeLocked puts a chunk at its offset, moving whatever is now contiguous
+// into recvBuf, and returns how many bytes were newly accepted. Caller holds
+// s.mu.
+func (s *Stream) placeLocked(offset uint64, data []byte) int {
+	end := offset + uint64(len(data))
+
+	// Already delivered. A retransmission of data the application has seen
+	// arrives here, and must not be appended a second time — the byte stream
+	// would be corrupted, and the Noise layer above would fail its MAC rather
+	// than merely reading duplicates.
+	if end <= s.recvOffset {
+		return 0
+	}
+
+	// Partly delivered: keep only the tail that is new.
+	if offset < s.recvOffset {
+		data = data[s.recvOffset-offset:]
+		offset = s.recvOffset
+	}
+
+	if offset > s.recvOffset {
+		// Ahead of the gap. Hold it until the missing bytes arrive.
+		if _, exists := s.recvOOO[offset]; exists {
+			return 0
+		}
+		// Flow control is the real bound on this buffer; the cap is only a
+		// backstop against a peer that ignores its limit, which is why it sits
+		// well above the largest window rather than at it.
+		//
+		// Discarding here is never safe. The packet was acknowledged on
+		// arrival, so the sender has already stopped tracking it and will never
+		// send those bytes again: dropping them silently strands the stream at
+		// that offset for good. A cap equal to MaxStreamRecvWindow did exactly
+		// that, because a stream whose window has auto-tuned to the maximum can
+		// legitimately have the whole window sitting out of order — the netem
+		// reorder-20pct condition hit it and hung for the full two minutes.
+		// Hitting the backstop now means the peer is misbehaving, so say so
+		// rather than quietly losing data.
+		if s.oooBytes+len(data) > maxStreamRecvOOO {
+			s.flowControlViolation = true
+			return 0
+		}
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		s.recvOOO[offset] = buf
+		s.oooBytes += len(buf)
+		return len(buf)
+	}
+
+	s.recvBuf = append(s.recvBuf, data...)
+	s.recvOffset = end
+	accepted := len(data)
+
+	// Release anything that was waiting on the bytes just delivered.
+	for {
+		chunk, ok := s.recvOOO[s.recvOffset]
+		if !ok {
+			break
+		}
+		delete(s.recvOOO, s.recvOffset)
+		s.oooBytes -= len(chunk)
+		s.recvBuf = append(s.recvBuf, chunk...)
+		s.recvOffset += uint64(len(chunk))
+	}
+	return accepted
+}
+
+// DeliverFin records where the stream ends. finalSize is the offset one past
+// the peer's last byte.
+//
+// A FIN carries no data of its own and can overtake data still in flight, so
+// arrival is not the same as completion: treating it as EOF on sight would
+// truncate the tail. The stream finishes when the delivered bytes reach
+// finalSize, which may be now or may be several packets away.
+func (s *Stream) DeliverFin(finalSize uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.finSeen = true
+	s.finalSize = finalSize
+	s.finishLocked()
+	s.recvCond.Broadcast()
+}
+
+// finishLocked completes the stream once every byte up to finalSize has been
+// delivered. Caller holds s.mu.
+func (s *Stream) finishLocked() {
+	if !s.finSeen || s.finReceived || s.recvOffset < s.finalSize {
+		return
+	}
 	s.finReceived = true
 	if s.state == StreamStateHalfClosedLocal {
 		s.state = StreamStateClosed
 	} else {
 		s.state = StreamStateHalfClosedRemote
 	}
-	s.recvCond.Broadcast()
 }
 
 // DeliverReset handles a RESET_STREAM from the remote.
