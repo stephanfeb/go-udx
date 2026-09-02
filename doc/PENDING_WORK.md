@@ -11,66 +11,73 @@ Current as of 2026-08-28.
 
 ## 1. Retransmission can still abandon data
 
-**Status:** open. The most substantial correctness gap remaining.
+**Status:** CLOSED (2026-08-30). Retransmission now re-sends under fresh sequence
+numbers and no longer abandons data; §2 below is the backstop.
 
-`PacketManager.scheduleRetransmission` gives up after `MaxRetransmitRetries`
-attempts. Because retransmission re-sends a packet under its *original*
-sequence number, the retry budget belongs to that packet, and exhausting it
-abandons the bytes it carried. The stream then has a permanent hole and cannot
-complete.
+`PacketManager.scheduleRetransmission` used to give up after
+`MaxRetransmitRetries` attempts. Because a retransmission re-sent a packet under
+its *original* sequence number, the retry budget belonged to that packet, and
+exhausting it abandoned the bytes it carried — `Connection.abandonStream` reset
+the stream (`ErrStreamReset`) rather than let it hang. Safe, but weaker than the
+RFC: a recoverable stream failed instead of recovering. Under the sustained loss
+of a real relay path this reset store-and-forward streams mid-transfer, which is
+what stalled device pairing (the relay read the reset as `EOF`).
 
-`Connection.abandonStream` makes that visible rather than silent: the stream is
-reset, so the application gets `ErrStreamReset` instead of a hang. That is the
-honest outcome for an unrecoverable stream, but it is a way of reporting the
-gap, not of closing it.
+**The fix (QUIC's model, RFC 9002 — no retry limit; RFC 9000 §12.3 — packet
+numbers are never reused):**
 
-**This is not what QUIC does.** RFC 9002 has no retry limit. Lost data is
-re-framed into a *new* packet with a *new* packet number — packet numbers are
-never reused (RFC 9000 §12.3) — so the retry budget never attaches to the data.
-Delivery is bounded by the connection's idle timeout, not by a count, and
-individual streams are never reset because of loss.
+- `PacketManager.Retransmit` allocates a **new** sequence for the packet and
+  transfers its tracking (and its retransmit timer) from the old number to the
+  new. Safe because both v3 stacks reassemble streams on byte offsets, not
+  sequence order: a duplicate is discarded by its offset, and the retransmission
+  is acknowledged unambiguously (no Karn ambiguity — `SentTime` is reset on the
+  re-key, so the RTT sample is honest).
+- The per-packet retry cap is **gone**. A packet is re-sent for as long as the
+  connection lives; what ends a genuinely dead path is §2's idle timeout closing
+  the whole connection, not a count resetting one stream.
+- Congestion accounting stays correct without double-counting: the bytes stay in
+  flight across the re-key, so a retransmission calls **no** `OnPacketSent`, and
+  ACK-based loss detection contracts the window through the new
+  `CongestionController.OnCongestionEvent` (cwnd only, idempotent per recovery
+  epoch) instead of the old inflight-decrementing `OnPacketLost`. This also fixed
+  a latent gap: SACK-detected loss previously informed congestion control of
+  nothing at all.
 
-Adding per-stream byte offsets was expected to close this and does not. The hole
-moved from a sequence number to a byte offset; it is still a hole. What actually
-closes it is retransmitting under fresh sequence numbers, which needs:
+The RTO timer and SACK-driven loss detection both route through `Retransmit`,
+which collapses a resend that the other has already covered within the last RTO,
+so one loss produces one resend.
 
-- `Connection.retransmitPacket` to allocate a new sequence rather than reuse the
-  old one, and the packet manager to transfer tracking from the old number to
-  the new;
-- the retry budget to move from the packet to the connection, so exhausting it
-  ends the connection (as an idle timeout would) rather than killing one stream;
-- care that the congestion controller sees exactly one `OnPacketSent` per
-  transmission and does not double-count, which is a mistake this code has
-  already made once (see `d9b1dc7`).
-
-The current behaviour is safe, just weaker than the RFC's: a stream that hits it
-fails cleanly instead of recovering.
+Covered by `retransmit_recovery_test.go` (re-key, SentTime reset, trigger
+collapse, acked no-op) and the interop suite against the real Dart stack.
 
 ---
 
 ## 2. `MaxIdleTimeout` is declared but never enforced
 
-**Status:** open, and it interacts with the above.
+**Status:** CLOSED (2026-08-30). Enforced by a per-connection watchdog.
 
-`MaxIdleTimeout` exists in `constants.go` and nothing reads it. A connection with
-no traffic is never closed, which is why exhausting the retransmission budget is
-currently the *only* thing that surfaces an unrecoverable packet to the
-application.
+`MaxIdleTimeout` used to sit in `constants.go` with nothing reading it, so a
+connection with no traffic was never closed. That is now the backstop that ends
+a dead path (which §1 no longer does by exhausting a retry count):
 
-QUIC's rules (RFC 9000 §10.1) are worth copying if this is implemented:
+- `Connection` stamps `lastActivity` on every received packet (`HandlePacket`)
+  and a self-rearming watchdog (`armIdleCheck`/`onIdleCheck`) closes the
+  connection once it has been silent longer than `idleTimeout()`.
+- `idleTimeout()` is `max(MaxIdleTimeout, 3 × PTO)` — **at least three PTOs**
+  (RFC 9000 §10.1), so loss recovery always gets a chance first. The RTO is
+  capped at 5s today, so the 30s floor wins in practice; the `max()` keeps it
+  correct if that cap ever rises.
+- Expiry closes the connection **silently** — `closeInternal(..., announce:
+  false)` sends no CONNECTION_CLOSE (RFC 9000 §10.1) but still resets the streams
+  so blocked readers and writers wake with `ErrStreamReset` rather than hang.
 
-- negotiated as a transport parameter, with the effective value the **minimum**
-  of what the two ends advertise (zero disables);
-- restarted on receiving and successfully processing a packet, and on sending an
-  ack-eliciting packet when none has been sent since the last receipt;
-- **at least three times the current PTO**, so loss recovery always gets a
-  chance before the connection is declared idle. This is dynamic — a fixed
-  constant is wrong on a slow path, where the retransmission budget stretches
-  with the RTO and can exceed a fixed 30s;
-- expiry closes the connection **silently**, with no CONNECTION_CLOSE.
+Not negotiated as a transport parameter (the effective-value = min-of-both-ends
+rule); this is a local enforcement of the local constant. Wire negotiation is a
+larger protocol change and was not needed to close the gap.
 
-Deferred because it is a design question — when should a quiet connection die? —
-rather than a defect with one obvious answer.
+Covered by `retransmit_recovery_test.go` (idle-close wakes readers, receipt
+keeps a connection alive, the ≥3×PTO relationship) and, end-to-end over real
+sockets, `TestWriter_OnADeadPathFailsRatherThanHanging`.
 
 ---
 

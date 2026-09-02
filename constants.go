@@ -143,23 +143,16 @@ const (
 
 // Retransmission
 //
-// The budget is sized against MaxIdleTimeout: on a healthy path a packet runs
-// out of attempts at roughly 28s, just inside 30s. On a slow path the backoff
-// tracks the RTO instead of the cap and the budget stretches with it, which is
-// the right trade — a long round trip earns more time, not fewer tries.
+// There is no per-packet retry cap. A lost packet is re-sent under a fresh
+// sequence number (Connection.retransmitPacket via PacketManager.Retransmit)
+// for as long as the connection lives; what ends a path that has genuinely gone
+// away is MaxIdleTimeout closing the whole connection, not a count running out
+// on one packet. This is QUIC's model (RFC 9002 has no retry limit; delivery is
+// bounded by the idle timeout), and it is why loss can no longer strand a
+// stream with an unfillable hole and reset it.
 //
-// It used to be 10 attempts with the backoff capped at 30s, which spent them
-// over ~111s. Most of that went on waiting rather than trying: the last two
-// attempts alone accounted for 60s. Capping the backoff buys 16 attempts in a
-// quarter of the time.
-//
-// Note that MaxIdleTimeout is declared but not currently enforced anywhere, so
-// running out of attempts is the ONLY thing that surfaces an unrecoverable
-// packet. That is why exhausting them resets the stream (Connection.
-// abandonStream) rather than silently dropping the packet: nothing else would
-// ever tell the application.
+// The backoff below only shapes how fast successive attempts are spaced.
 const (
-	MaxRetransmitRetries = 16
 	MinRetransmitTimeout = 200 * time.Millisecond
 
 	// MaxRetransmitBackoff caps the wait between attempts. It is a ceiling, not

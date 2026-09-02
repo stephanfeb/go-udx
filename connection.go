@@ -75,6 +75,13 @@ type Connection struct {
 	sendCreditMu sync.Mutex
 	sendCredit   *sync.Cond
 
+	// Idle timeout (RFC 9000 section 10.1). lastActivity is stamped on every
+	// received packet; a self-rearming watchdog closes the connection once it
+	// has been silent longer than idleTimeout(). This is the backstop that ends
+	// a dead path now that retransmission never gives up on its own.
+	lastActivity time.Time
+	idleTimer    *time.Timer
+
 	// Close
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -118,13 +125,12 @@ func NewConnection(
 		return -1
 	})
 	c.pm = NewPacketManager(clk, c.cc)
-	c.pm.OnRetransmit = func(pkt *SentPacket) {
-		c.retransmitPacket(pkt)
-	}
-	c.pm.OnPacketPermanentLoss = func(pkt *SentPacket) {
-		c.cc.OnPacketLost(pkt.Size)
-		c.abandonStream(pkt)
-	}
+	// Retransmission re-keys the packet under a fresh sequence inside the packet
+	// manager and then calls this to put it on the wire; the callback only
+	// marshals and sends. There is no permanent-loss callback any more: a packet
+	// is re-sent until acknowledged, and a path that has gone silent is ended by
+	// the idle timeout closing the whole connection, not by resetting one stream.
+	c.pm.OnRetransmit = c.retransmitPacket
 	c.fc = NewFlowController(int64(InitialMaxData), int64(InitialMaxData))
 
 	// Odd stream IDs for initiator, even for responder
@@ -133,6 +139,8 @@ func NewConnection(
 	} else {
 		c.nextStreamID = 2
 	}
+
+	c.startIdleTimer()
 
 	return c
 }
@@ -178,19 +186,32 @@ func (c *Connection) Close() error {
 	return c.CloseWithError(ErrorNoError, "")
 }
 
-// CloseWithError closes the connection with an error code and reason.
+// CloseWithError closes the connection with an error code and reason, telling
+// the peer with a CONNECTION_CLOSE.
 func (c *Connection) CloseWithError(code uint32, reason string) error {
+	return c.closeInternal(code, reason, true)
+}
+
+// closeInternal tears the connection down once. When announce is true it sends
+// a CONNECTION_CLOSE first; the idle path sets it false, because RFC 9000
+// section 10.1 closes an idle connection silently — there may be nothing left
+// on the path to hear it, and sending into a black hole risks amplification.
+// Either way, blocked readers and writers are woken through the stream resets.
+func (c *Connection) closeInternal(code uint32, reason string, announce bool) error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.state = ConnStateClosing
+		if c.idleTimer != nil {
+			c.idleTimer.Stop()
+		}
 		c.mu.Unlock()
 
-		// Send CONNECTION_CLOSE
-		frame := &ConnectionCloseFrame{
-			ErrorCode:    code,
-			ReasonPhrase: reason,
+		if announce {
+			c.sendFrames([]Frame{&ConnectionCloseFrame{
+				ErrorCode:    code,
+				ReasonPhrase: reason,
+			}})
 		}
-		c.sendFrames([]Frame{frame})
 
 		c.mu.Lock()
 		c.state = ConnStateClosed
@@ -219,6 +240,62 @@ func (c *Connection) CloseWithError(code uint32, reason string) error {
 		}
 	})
 	return nil
+}
+
+// startIdleTimer stamps the connection live and arms the idle watchdog.
+func (c *Connection) startIdleTimer() {
+	c.mu.Lock()
+	c.lastActivity = c.clk.Now()
+	c.mu.Unlock()
+	c.armIdleCheck()
+}
+
+// idleCheckInterval is how often the watchdog wakes to test for silence. It is
+// a poll granularity, not the timeout itself — the timeout is idleTimeout().
+const idleCheckInterval = 1 * time.Second
+
+func (c *Connection) armIdleCheck() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closeCh:
+		return // already closed; stop rearming
+	default:
+	}
+	c.idleTimer = c.clk.AfterFunc(idleCheckInterval, c.onIdleCheck)
+}
+
+func (c *Connection) onIdleCheck() {
+	if c.idleExpired() {
+		c.closeInternal(ErrorConnectionTimeout, "idle timeout", false)
+		return
+	}
+	c.armIdleCheck()
+}
+
+// idleTimeout is the silence a connection tolerates before it is closed. RFC
+// 9000 section 10.1 requires at least three PTOs, so loss recovery always gets
+// a chance before the path is declared dead. That floor is dynamic: on a slow
+// link the retransmission schedule stretches with the RTO and can exceed a
+// fixed 30s, so the timeout has to stretch with it rather than cut recovery off.
+func (c *Connection) idleTimeout() time.Duration {
+	d := MaxIdleTimeout
+	if pto := 3 * c.pm.retransmitTimeout(); pto > d {
+		d = pto
+	}
+	return d
+}
+
+// idleExpired reports whether the connection has received nothing for longer
+// than idleTimeout(). A connection already closing or closed never "expires".
+func (c *Connection) idleExpired() bool {
+	timeout := c.idleTimeout()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == ConnStateClosing || c.state == ConnStateClosed {
+		return false
+	}
+	return c.clk.Now().Sub(c.lastActivity) >= timeout
 }
 
 // Ping sends a PING and waits for acknowledgment.
@@ -325,31 +402,6 @@ func (c *Connection) awaitSendCredit(size int, deadline time.Time) bool {
 }
 
 func (c *Connection) clock() Clock { return c.clk }
-
-// abandonStream tears down the stream a permanently-lost packet belonged to.
-//
-// Retransmission gives up eventually, and a reliable ordered stream cannot
-// survive that: the bytes in the abandoned packet are a hole in the middle of
-// the byte stream, so the peer's reader waits on a sequence that will never be
-// offered again. Previously the packet was simply dropped from the tracking
-// table and the stream left in place, which meant an application saw the
-// connection stop rather than an error — the same silent stall that showed up
-// downstream as 40s yamux keepalive timeouts instead of an actionable failure.
-//
-// Reset is the honest outcome. Stream.Reset both wakes the local reader and
-// writer with ErrStreamReset and sends RESET_STREAM so the peer's side fails
-// too; it is idempotent, so losing several packets on one stream resets it once.
-//
-// Only data-bearing packets are tracked for retransmission, so a lost packet
-// always belongs to a stream. SourceStreamID is our local ID and
-// DestinationStreamID the peer's, matching how sendPacket recorded them.
-func (c *Connection) abandonStream(pkt *SentPacket) {
-	s := c.findStream(pkt.SourceStreamID, pkt.DestinationStreamID)
-	if s == nil {
-		return
-	}
-	s.Reset(ErrorInternalError)
-}
 
 // findStream looks up a stream by local ID first, then falls back to searching
 // by remote ID. This is needed because the Dart UDX transport assigns random
@@ -463,27 +515,26 @@ func (c *Connection) sendFrames(frames []Frame) {
 	c.sendPacket(0, 0, frames)
 }
 
-// retransmitPacket re-sends a lost packet using its ORIGINAL sequence number.
-// This bypasses sendPacket() to avoid allocating a new sequence (which would
-// break the receiver's ordering and corrupt the Noise nonce chain).
+// retransmitPacket puts a packet back on the wire. PacketManager.Retransmit has
+// already advanced pkt.Sequence to a fresh number and re-keyed its tracking, so
+// this only marshals and sends — under the new sequence, QUIC-style, never the
+// original (RFC 9000 section 12.3).
+//
+// No OnPacketSent: the bytes were charged to the congestion window at their
+// first transmission and remain in flight until acknowledged. A retransmission
+// carries the same bytes, so counting it again would double-charge one packet.
 func (c *Connection) retransmitPacket(pkt *SentPacket) {
-	c.pm.MarkRetransmitted(pkt)
-
 	rePkt := &Packet{
 		Version:             VersionCurrent,
 		DestinationCID:      c.remoteCID,
 		SourceCID:           c.localCID,
-		Sequence:            pkt.Sequence, // original sequence number
+		Sequence:            pkt.Sequence, // the fresh sequence assigned by Retransmit
 		DestinationStreamID: pkt.DestinationStreamID,
 		SourceStreamID:      pkt.SourceStreamID,
 		Frames:              pkt.Frames,
 	}
 
 	data := MarshalPacket(rePkt)
-
-	// No OnPacketSent here: the original transmission is still counted in
-	// inflight and this packet keeps its original sequence number, so counting
-	// it again would double-charge the congestion window for one packet.
 
 	c.mu.Lock()
 	c.bytesSent += int64(len(data))
@@ -512,6 +563,10 @@ func (c *Connection) retransmitPacket(pkt *SentPacket) {
 func (c *Connection) HandlePacket(pkt *Packet) {
 	c.mu.Lock()
 	c.bytesReceived += int64(len(MarshalPacket(pkt)))
+	// Any packet received is proof the path is alive; restart the idle clock
+	// (RFC 9000 section 10.1: the timer resets on receiving and processing a
+	// packet).
+	c.lastActivity = c.clk.Now()
 	c.mu.Unlock()
 
 	seq := pkt.Sequence
@@ -788,10 +843,20 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 	}
 
 	// SACK-based loss detection: retransmit packets that fall within gaps.
+	//
+	// A detected loss both contracts the window (OnCongestionEvent, idempotent
+	// within the recovery epoch) and re-sends the packet under a fresh sequence.
+	// Retransmit collapses a resend that a firing RTO timer has already covered,
+	// so a packet is not sent twice for one loss. The bytes never leave inflight
+	// across this — they are being recovered, not abandoned — so there is no
+	// OnPacketLost/OnPacketSent pair to balance here.
 	lost := c.pm.DetectLostPackets(f)
 	for _, seq := range lost {
 		if pkt := c.pm.GetPacket(seq); pkt != nil {
-			c.retransmitPacket(pkt)
+			c.cc.OnCongestionEvent()
+			if _, ok := c.pm.Retransmit(pkt); ok {
+				c.retransmitPacket(pkt)
+			}
 		}
 	}
 }

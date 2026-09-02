@@ -280,15 +280,35 @@ func (cc *CongestionController) cubicUpdate(bytes int) {
 	}
 }
 
-// OnPacketLost is called when packets are considered lost.
+// OnPacketLost is called when a packet is abandoned outright: its bytes leave
+// flight and the window contracts. Retransmitted loss does NOT come through
+// here — the bytes stay in flight until acknowledged, so a resent packet must
+// not be double-counted out of inflight. That path calls OnCongestionEvent,
+// which contracts the window without touching inflight.
 func (cc *CongestionController) OnPacketLost(bytes int) {
 	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
 	cc.inflight -= bytes
 	if cc.inflight < 0 {
 		cc.inflight = 0
 	}
+	cc.mu.Unlock()
+
+	cc.OnCongestionEvent()
+}
+
+// OnCongestionEvent contracts the congestion window in response to detected
+// loss, WITHOUT altering inflight. It is the reaction to loss that is being
+// recovered by retransmission (RFC 9002 section 7): the lost bytes are re-sent,
+// not abandoned, so they remain accounted in flight until the retransmission is
+// acknowledged. Double-counting them out of inflight here would open the window
+// spuriously.
+//
+// Idempotent within a recovery epoch (RFC 9002 section 7.3.1): the first loss
+// halves the window and the rest of the same round-trip's losses are absorbed,
+// so calling it once per lost packet still reduces the window only once.
+func (cc *CongestionController) OnCongestionEvent() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
 
 	if cc.inRecovery {
 		return

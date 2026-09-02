@@ -27,31 +27,34 @@ type PacketManager struct {
 	nextSeq          uint32
 	lastSentSeq      int // -1 if nothing sent
 
-	// Sent packets awaiting ACK
+	// Sent packets awaiting ACK, keyed by their CURRENT sequence number. A
+	// retransmission re-keys its packet under a fresh sequence (see Retransmit),
+	// so an entry moves from one number to the next over the packet's life.
 	sentPackets map[uint32]*SentPacket
 
-	// Retransmission timers
-	retransmitTimers   map[uint32]*time.Timer
-	retransmitAttempts map[uint32]int
+	// Retransmission timers, keyed the same way as sentPackets and re-keyed
+	// alongside them: one live timer per unacked packet, following it across
+	// renumberings.
+	retransmitTimers map[uint32]*time.Timer
 
 	// Congestion controller reference (for RTO calculation)
 	cc *CongestionController
 
-	// Callbacks
-	OnRetransmit          func(pkt *SentPacket)
-	OnPacketPermanentLoss func(pkt *SentPacket)
+	// OnRetransmit puts a packet back on the wire. By the time it is called the
+	// packet's Sequence has already been advanced to a fresh number, so the
+	// callback only marshals and sends.
+	OnRetransmit func(pkt *SentPacket)
 }
 
 // NewPacketManager creates a new packet manager.
 func NewPacketManager(clock Clock, cc *CongestionController) *PacketManager {
 	return &PacketManager{
 		clock:              clock,
-		nextSeq:            0,
-		lastSentSeq:        -1,
-		sentPackets:        make(map[uint32]*SentPacket),
-		retransmitTimers:   make(map[uint32]*time.Timer),
-		retransmitAttempts: make(map[uint32]int),
-		cc:                 cc,
+		nextSeq:          0,
+		lastSentSeq:      -1,
+		sentPackets:      make(map[uint32]*SentPacket),
+		retransmitTimers: make(map[uint32]*time.Timer),
+		cc:               cc,
 	}
 }
 
@@ -150,7 +153,6 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 					t.Stop()
 					delete(pm.retransmitTimers, seq)
 				}
-				delete(pm.retransmitAttempts, seq)
 				acked = append(acked, pkt)
 			}
 		}
@@ -169,7 +171,6 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 					t.Stop()
 					delete(pm.retransmitTimers, seq)
 				}
-				delete(pm.retransmitAttempts, seq)
 				acked = append(acked, pkt)
 			}
 		}
@@ -192,18 +193,71 @@ func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 	return acked
 }
 
-// MarkRetransmitted records an attempt to re-send a packet.
+// Retransmit prepares an unacked packet to be re-sent under a FRESH sequence
+// number, returning the new sequence and true when the caller should send it.
 //
-// The counters live on SentPacket but DetectLostPackets reads them under pm.mu
-// to decide whether a packet was retransmitted recently enough to skip, so they
-// have to be written under it too. They used to be incremented directly by the
-// connection's retransmit path, off-lock, which raced with SACK-driven loss
-// detection whenever a retransmit timer fired while an ACK was being processed.
-func (pm *PacketManager) MarkRetransmitted(pkt *SentPacket) {
+// Reusing the original number is what made loss fatal. The retry budget rode on
+// the packet, so exhausting it left a hole the stream could never fill and the
+// stream was reset (ErrStreamReset). QUIC never reuses a packet number
+// (RFC 9000 section 12.3): lost data is re-framed into a new packet, and
+// delivery is bounded by the connection's idle timeout rather than a per-packet
+// count. Both v3 stacks reassemble streams on byte offsets, not sequence order,
+// so a fresh number is safe here — a duplicate is discarded by its offset, and
+// the retransmission is acknowledged unambiguously, so no Karn ambiguity
+// poisons the RTT estimate.
+//
+// The re-key moves the tracking entry and the retransmit timer from the old
+// number to the new, bumps the attempt count, and — because a fresh sequence is
+// a fresh transmission — resets SentTime, so both the RTT sample and the loss
+// timer measure from now.
+//
+// It touches neither inflight nor the congestion window: the bytes stay in
+// flight across the re-key. Congestion accounting is the caller's, and differs
+// by trigger — a timer-driven resend is a probe and changes nothing, while a
+// loss-detected resend pairs with OnCongestionEvent.
+//
+// Returns (0, false) when the packet was already acknowledged, or was
+// retransmitted within the last RTO — collapsing a near-simultaneous RTO timer
+// and SACK-driven retransmit into a single send.
+func (pm *PacketManager) Retransmit(pkt *SentPacket) (uint32, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	oldSeq := pkt.Sequence
+	if _, ok := pm.sentPackets[oldSeq]; !ok {
+		// Already acknowledged and removed; drop any lingering timer.
+		if t, ok := pm.retransmitTimers[oldSeq]; ok {
+			t.Stop()
+			delete(pm.retransmitTimers, oldSeq)
+		}
+		return 0, false
+	}
+
+	now := pm.clock.Now()
+	if pkt.RetransmitCount > 0 && now.Sub(pkt.LastRetransmit) < pm.retransmitTimeout() {
+		// Another trigger re-sent this within the last RTO; one send is enough.
+		return 0, false
+	}
+
+	newSeq := pm.nextSeq
+	pm.nextSeq++
+
+	if t, ok := pm.retransmitTimers[oldSeq]; ok {
+		t.Stop()
+		delete(pm.retransmitTimers, oldSeq)
+	}
+	delete(pm.sentPackets, oldSeq)
+
+	pkt.Sequence = newSeq
 	pkt.RetransmitCount++
-	pkt.LastRetransmit = pm.clock.Now()
+	pkt.LastRetransmit = now
+	pkt.SentTime = now
+	pm.sentPackets[newSeq] = pkt
+
+	backoff := pm.retransmitBackoff(pkt.RetransmitCount)
+	pm.retransmitTimers[newSeq] = pm.clock.AfterFunc(backoff, func() { pm.onRetransmitTimer(pkt) })
+
+	return newSeq, true
 }
 
 // GetPacket returns a sent packet by sequence number.
@@ -302,59 +356,29 @@ func (pm *PacketManager) PendingCount() int {
 	return len(pm.sentPackets)
 }
 
+// scheduleRetransmission arms the first RTO timer for a freshly-sent packet.
+// Every subsequent timer is armed by Retransmit as it re-keys the packet, so
+// there is exactly one live timer per unacked packet, following it across
+// renumberings. There is no per-packet retry cap: a packet is re-sent under a
+// fresh sequence until it is acknowledged or the connection's idle timeout
+// closes a path that has gone silent.
 func (pm *PacketManager) scheduleRetransmission(pkt *SentPacket) {
-	retryCount := 0
-	seq := pkt.Sequence
-
-	var retransmit func()
-	retransmit = func() {
-		pm.mu.Lock()
-		if _, ok := pm.sentPackets[seq]; !ok {
-			// Already ACKed
-			if t, ok := pm.retransmitTimers[seq]; ok {
-				t.Stop()
-				delete(pm.retransmitTimers, seq)
-			}
-			pm.mu.Unlock()
-			return
-		}
-
-		retryCount++
-		if retryCount <= MaxRetransmitRetries {
-			pm.retransmitAttempts[seq] = retryCount
-			p := pm.sentPackets[seq]
-			pm.mu.Unlock()
-
-			if pm.OnRetransmit != nil {
-				pm.OnRetransmit(p)
-			}
-
-			backoff := pm.retransmitBackoff(retryCount)
-
-			pm.mu.Lock()
-			pm.retransmitTimers[seq] = pm.clock.AfterFunc(backoff, retransmit)
-			pm.mu.Unlock()
-		} else {
-			// Give up
-			if t, ok := pm.retransmitTimers[seq]; ok {
-				t.Stop()
-				delete(pm.retransmitTimers, seq)
-			}
-			p := pm.sentPackets[seq]
-			delete(pm.sentPackets, seq)
-			delete(pm.retransmitAttempts, seq)
-			pm.mu.Unlock()
-
-			if pm.OnPacketPermanentLoss != nil && p != nil {
-				pm.OnPacketPermanentLoss(p)
-			}
-		}
-	}
-
 	rto := pm.retransmitTimeout()
 	pm.mu.Lock()
-	pm.retransmitTimers[seq] = pm.clock.AfterFunc(rto, retransmit)
+	pm.retransmitTimers[pkt.Sequence] = pm.clock.AfterFunc(rto, func() { pm.onRetransmitTimer(pkt) })
 	pm.mu.Unlock()
+}
+
+// onRetransmitTimer fires when a packet's RTO elapses without an ACK. It
+// re-keys the packet under a fresh sequence (which also arms the next timer)
+// and puts it back on the wire. A timer-driven resend is a probe, so it leaves
+// the congestion window alone — only ACK-based loss detection contracts it.
+func (pm *PacketManager) onRetransmitTimer(pkt *SentPacket) {
+	if _, ok := pm.Retransmit(pkt); ok {
+		if pm.OnRetransmit != nil {
+			pm.OnRetransmit(pkt)
+		}
+	}
 }
 
 // Destroy cancels all retransmission timers.
