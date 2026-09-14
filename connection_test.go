@@ -171,9 +171,9 @@ func TestConnection_BuildAckFrame_SimpleContiguous(t *testing.T) {
 	defer c.Close()
 
 	// Simulate receiving packets 1, 2, 3 in order
-	c.recvdDataSeqs[1] = struct{}{}
-	c.recvdDataSeqs[2] = struct{}{}
-	c.recvdDataSeqs[3] = struct{}{}
+	c.recvd.add(1)
+	c.recvd.add(2)
+	c.recvd.add(3)
 
 	ack := c.buildAckFrame(3)
 	if ack.LargestAcked != 3 {
@@ -192,8 +192,8 @@ func TestConnection_BuildAckFrame_SingleGap(t *testing.T) {
 	defer c.Close()
 
 	// Received 1, 3 (packet 2 lost)
-	c.recvdDataSeqs[1] = struct{}{}
-	c.recvdDataSeqs[3] = struct{}{}
+	c.recvd.add(1)
+	c.recvd.add(3)
 
 	ack := c.buildAckFrame(3)
 	if ack.LargestAcked != 3 {
@@ -218,11 +218,11 @@ func TestConnection_BuildAckFrame_MultipleGaps(t *testing.T) {
 	defer c.Close()
 
 	// Received: 1, 3, 5, 6, 7 (missing 2, 4)
-	c.recvdDataSeqs[1] = struct{}{}
-	c.recvdDataSeqs[3] = struct{}{}
-	c.recvdDataSeqs[5] = struct{}{}
-	c.recvdDataSeqs[6] = struct{}{}
-	c.recvdDataSeqs[7] = struct{}{}
+	c.recvd.add(1)
+	c.recvd.add(3)
+	c.recvd.add(5)
+	c.recvd.add(6)
+	c.recvd.add(7)
 
 	ack := c.buildAckFrame(7)
 	if ack.LargestAcked != 7 {
@@ -254,7 +254,7 @@ func TestConnection_BuildAckFrame_MatchesDartParsing(t *testing.T) {
 	// Test case from Dart ack_handling_test.dart:
 	// Received: 6, 7, 10, 11, 12, 14, 15 (gaps at 8, 9, 13)
 	for _, seq := range []uint32{6, 7, 10, 11, 12, 14, 15} {
-		c.recvdDataSeqs[seq] = struct{}{}
+		c.recvd.add(seq)
 	}
 
 	ack := c.buildAckFrame(15)

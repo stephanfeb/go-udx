@@ -7,6 +7,7 @@ A Go implementation of the UDX protocol — a QUIC-inspired reliable UDP transpo
 - **Stream multiplexing** — Multiple independent bidirectional streams over a single UDP connection
 - **CUBIC congestion control** — RFC 9002-based RTT estimation with CUBIC congestion avoidance
 - **Packet pacing** — Smooth send rate to avoid bursts
+- **Delayed acknowledgements** — one ACK per two in-order packets, at once on a gap or a stream edge, the wait reported in the frame (RFC 9000 §13.2)
 - **Flow control** — Connection-level and per-stream flow control with automatic window updates
 - **Path MTU Discovery** — RFC 8899 binary search between 1280–1500 bytes
 - **Connection migration** — PATH_CHALLENGE/PATH_RESPONSE for address validation

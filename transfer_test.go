@@ -393,9 +393,13 @@ func TestTransfer_NoAckAmplification(t *testing.T) {
 	dataPkts := total/(MaxDatagramSize-100) + 1
 	got := atomic.LoadInt64(&ackOnly)
 
-	// One ACK per data packet, with generous headroom for retransmissions.
-	if limit := int64(dataPkts * 4); got > limit {
-		t.Fatalf("ack amplification: %d ack-only datagrams for ~%d data packets (limit %d); "+
+	// Fewer ACKs than data packets: the receiver acknowledges every second
+	// in-order packet (AckElicitingThreshold), at once only for stream edges
+	// and gaps, and on loopback there are no gaps. One ACK per packet was the
+	// old steady state; the limit sits between the two so a return to it
+	// fails and a few retransmissions do not.
+	if limit := int64(dataPkts * 3 / 4); got > limit {
+		t.Fatalf("too many ACKs: %d ack-only datagrams for ~%d data packets (limit %d); "+
 			"total datagrams %d", got, dataPkts, limit, atomic.LoadInt64(&totalPkts))
 	}
 	t.Logf("%d data packets => %d ack-only datagrams, %d total",

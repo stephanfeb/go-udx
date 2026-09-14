@@ -33,19 +33,42 @@ const (
 	// chance to retransmit and release inflight bytes.
 	sendCreditPollInterval = 5 * time.Millisecond
 
-	InitialMaxStreams     = 100
-	MaxAckDelay          = 25 * time.Millisecond
-	AckDelayExponent     = 3
+	InitialMaxStreams = 100
+
+	// Acknowledgement policy (RFC 9000 section 13.2). A receiver acknowledges
+	// at once when a packet arrives out of order or opens or closes a stream,
+	// and otherwise after every AckElicitingThreshold data-bearing packets or
+	// when the ACK timer fires, whichever is first. Acknowledging every packet
+	// on arrival, which this did before, made the receiver send one datagram
+	// for every datagram it got: on a 137 KB transfer that was 100 ACKs, and
+	// on the server the read loop that also sends them spent as long in
+	// sendto as in recvfrom and saturated one core at ~150k datagrams/s.
+	AckElicitingThreshold = 2
+
+	// The ACK timer is a quarter of the smoothed RTT, clamped to this range.
+	// It is reported in the frame's AckDelay so the sender's RTT sample is not
+	// inflated by it, and MaxAckDelay is the most a sender will subtract (the
+	// RFC 9002 cap). A short floor keeps a lone packet on a fast path from
+	// waiting long: the packet the ACK releases from the sender's inflight
+	// accounting may be what its next write is waiting on.
+	MinAckDelay = 1 * time.Millisecond
+	MaxAckDelay = 25 * time.Millisecond
+
+	// ackHistory is how many sequences below the largest received the ACK
+	// builder remembers (recvTracker).
+	ackHistory = 512
+
+	AckDelayExponent = 3
 )
 
 // Error Codes
 const (
-	ErrorNoError          = 0x00
-	ErrorInternalError    = 0x01
-	ErrorStreamLimitError = 0x02
-	ErrorFlowControlError = 0x03
+	ErrorNoError           = 0x00
+	ErrorInternalError     = 0x01
+	ErrorStreamLimitError  = 0x02
+	ErrorFlowControlError  = 0x03
 	ErrorProtocolViolation = 0x04
-	ErrorInvalidMigration = 0x05
+	ErrorInvalidMigration  = 0x05
 	ErrorConnectionTimeout = 0x06
 )
 
@@ -58,10 +81,10 @@ const (
 
 // Congestion Control
 const (
-	MaxDatagramSize        = 1472
-	MinCongestionWindow    = 2 * MaxDatagramSize
+	MaxDatagramSize         = 1472
+	MinCongestionWindow     = 2 * MaxDatagramSize
 	InitialCongestionWindow = 10 * MaxDatagramSize
-	MaxCongestionWindow    = 1000 * MaxDatagramSize
+	MaxCongestionWindow     = 1000 * MaxDatagramSize
 
 	// Aliases used by congestion controller
 	InitialCwnd = InitialCongestionWindow
@@ -70,9 +93,9 @@ const (
 
 // CUBIC parameters
 const (
-	BetaCubic = 0.7
-	CubicC    = 0.4
-	PacingGain = 2.88
+	BetaCubic                     = 0.7
+	CubicC                        = 0.4
+	PacingGain                    = 2.88
 	PersistentCongestionThreshold = 3
 )
 
@@ -122,8 +145,8 @@ const (
 
 // Stateless Reset
 const (
-	StatelessResetTokenLength    = 16
-	MinStatelessResetPacketSize  = 39
+	StatelessResetTokenLength   = 16
+	MinStatelessResetPacketSize = 39
 )
 
 // Protocol Versions

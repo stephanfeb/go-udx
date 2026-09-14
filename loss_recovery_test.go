@@ -25,9 +25,9 @@ import (
 // receivedSet is a helper for describing which sequences a peer got.
 func ackFrameFor(t *testing.T, received []uint32, largest uint32) *AckFrame {
 	t.Helper()
-	c := &Connection{recvdDataSeqs: make(map[uint32]struct{})}
+	c := &Connection{}
 	for _, s := range received {
-		c.recvdDataSeqs[s] = struct{}{}
+		c.recvd.add(s)
 	}
 	return c.buildAckFrame(largest)
 }

@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	ErrMaxStreams        = errors.New("max streams exceeded")
+	ErrMaxStreams       = errors.New("max streams exceeded")
 	ErrHandshakeTimeout = errors.New("handshake timeout")
 )
 
@@ -30,18 +30,18 @@ const (
 type Connection struct {
 	mu sync.Mutex
 
-	localCID  ConnectionID
-	remoteCID ConnectionID
-	localAddr net.Addr
+	localCID   ConnectionID
+	remoteCID  ConnectionID
+	localAddr  net.Addr
 	remoteAddr net.Addr
 
 	state ConnectionState
 	clk   Clock
 
 	// Stream management
-	streams        map[uint32]*Stream
-	nextStreamID   uint32
-	isInitiator    bool
+	streams         map[uint32]*Stream
+	nextStreamID    uint32
+	isInitiator     bool
 	maxStreams      int
 	incomingStreams chan *Stream
 
@@ -55,9 +55,17 @@ type Connection struct {
 	pathChallenge     [8]byte
 	pathChallengeResp chan [8]byte
 
-	// Receive-side SACK tracking: records sequence numbers of received
-	// data-bearing packets so ACKs can include selective acknowledgment ranges.
-	recvdDataSeqs map[uint32]struct{}
+	// Receive-side acknowledgement state, under ackMu (never taken with mu
+	// held, and the timer callback takes it alone). recvd knows which
+	// data-bearing packets arrived, for the SACK ranges; ackPending counts
+	// those not yet acknowledged; ackTimer flushes them when the threshold
+	// is not reached; largestArrival is when the largest one arrived, for
+	// the AckDelay the frame reports.
+	ackMu          sync.Mutex
+	recvd          recvTracker
+	ackPending     int
+	ackTimer       *time.Timer
+	largestArrival time.Time
 
 	// Anti-amplification
 	bytesSent     int64
@@ -97,21 +105,20 @@ func NewConnection(
 	sendFunc func(data []byte, addr net.Addr) error,
 ) *Connection {
 	c := &Connection{
-		localCID:       localCID,
-		remoteCID:      remoteCID,
-		localAddr:      localAddr,
-		remoteAddr:     remoteAddr,
-		state:          ConnStateNew,
-		clk:            clk,
-		streams:        make(map[uint32]*Stream),
-		isInitiator:    isInitiator,
-		maxStreams:      InitialMaxStreams,
-		incomingStreams: make(chan *Stream, 16),
-		pmtud:        NewPMTUDController(),
-		recvdDataSeqs: make(map[uint32]struct{}),
+		localCID:          localCID,
+		remoteCID:         remoteCID,
+		localAddr:         localAddr,
+		remoteAddr:        remoteAddr,
+		state:             ConnStateNew,
+		clk:               clk,
+		streams:           make(map[uint32]*Stream),
+		isInitiator:       isInitiator,
+		maxStreams:        InitialMaxStreams,
+		incomingStreams:   make(chan *Stream, 16),
+		pmtud:             NewPMTUDController(),
 		pathChallengeResp: make(chan [8]byte, 1),
-		sendFunc:       sendFunc,
-		closeCh:        make(chan struct{}),
+		sendFunc:          sendFunc,
+		closeCh:           make(chan struct{}),
 	}
 
 	c.sendCredit = sync.NewCond(&c.sendCreditMu)
@@ -205,6 +212,13 @@ func (c *Connection) closeInternal(code uint32, reason string, announce bool) er
 			c.idleTimer.Stop()
 		}
 		c.mu.Unlock()
+		c.ackMu.Lock()
+		if c.ackTimer != nil {
+			c.ackTimer.Stop()
+			c.ackTimer = nil
+		}
+		c.ackPending = 0
+		c.ackMu.Unlock()
 
 		if announce {
 			c.sendFrames([]Frame{&ConnectionCloseFrame{
@@ -561,15 +575,20 @@ func (c *Connection) retransmitPacket(pkt *SentPacket) {
 // stall the stream permanently. The offsets answer the question exactly, so
 // nothing is gained by asking twice.
 func (c *Connection) HandlePacket(pkt *Packet) {
+	// Packets decoded from the wire carry their datagram length; ones built
+	// in-process (tests) are measured. This used to re-encode every packet
+	// received just to count its bytes, on the read loop, under the lock.
+	size := pkt.wireLen
+	if size == 0 {
+		size = len(MarshalPacket(pkt))
+	}
 	c.mu.Lock()
-	c.bytesReceived += int64(len(MarshalPacket(pkt)))
+	c.bytesReceived += int64(size)
 	// Any packet received is proof the path is alive; restart the idle clock
 	// (RFC 9000 section 10.1: the timer resets on receiving and processing a
 	// packet).
 	c.lastActivity = c.clk.Now()
 	c.mu.Unlock()
-
-	seq := pkt.Sequence
 
 	// Every frame is handled on arrival. Nothing is queued waiting for an
 	// earlier packet: STREAM frames carry their own offset, so a stream places
@@ -583,11 +602,6 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		return
 	}
 
-	// Send ACK with SACK ranges so the remote sender can identify lost packets.
-	// This reflects *receipt*, not delivery: a packet buffered ahead of a gap is
-	// still safely held, and reporting it lets the peer retransmit only what is
-	// genuinely missing.
-	//
 	// Only data-bearing packets are acknowledged. Acknowledging control-only
 	// packets makes every ACK provoke an ACK in return, which ping-pongs
 	// without end: a 64KB transfer measured ~176,000 ack-only datagrams for 48
@@ -595,113 +609,107 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 	// independently — sendPacket only registers data-bearing packets with the
 	// packet manager, so an ACK for a control packet can never match anything
 	// in flight.
-	if seq > 0 {
-		c.mu.Lock()
-		c.recvdDataSeqs[seq] = struct{}{}
-		c.mu.Unlock()
-	}
-	c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{c.buildAckFrame(seq)})
+	c.noteReceived(pkt)
 }
 
-// buildAckFrame constructs an AckFrame with SACK ranges from received data
-// packet sequences. This allows the remote sender to identify exactly which
-// packets were lost and selectively retransmit them.
+// noteReceived records a data-bearing packet and decides whether to
+// acknowledge now or later (RFC 9000 section 13.2). ACKs reflect *receipt*,
+// not delivery: a packet buffered ahead of a gap is still safely held, and
+// reporting it lets the peer retransmit only what is genuinely missing.
+//
+// Now: the packet is out of order (the sender should learn of the gap
+// without waiting), or it opens or closes a stream (a SYN is what a dial or
+// stream open is waiting on; a FIN's ACK lets the sender retire the stream),
+// or it is the AckElicitingThreshold-th unacknowledged packet. Later: the
+// ACK timer, a quarter of the smoothed RTT within [MinAckDelay, MaxAckDelay],
+// and the frame reports how long it waited so the sender's RTT sample stays
+// honest. Every packet used to be acknowledged on arrival, which doubled the
+// datagrams a receiver handles and, on the server, saturated the single read
+// loop that both receives and sends those ACKs.
+func (c *Connection) noteReceived(pkt *Packet) {
+	seq := pkt.Sequence
+	now := c.clk.Now()
+	edge := false
+	for _, f := range pkt.Frames {
+		if sf, ok := f.(*StreamFrame); ok && (sf.IsSyn || sf.IsFin) {
+			edge = true
+			break
+		}
+	}
+
+	c.ackMu.Lock()
+	outOfOrder := false
+	if seq > 0 {
+		hadAny, before := c.recvd.any, c.recvd.largest
+		outOfOrder = c.recvd.add(seq)
+		if !hadAny || c.recvd.largest != before {
+			c.largestArrival = now
+		}
+	}
+	c.ackPending++
+	if outOfOrder || edge || c.ackPending >= AckElicitingThreshold {
+		frame := c.takeAckLocked(now)
+		c.ackMu.Unlock()
+		c.sendPacket(pkt.SourceStreamID, pkt.DestinationStreamID, []Frame{frame})
+		return
+	}
+	if c.ackTimer == nil {
+		delay := c.cc.SmoothedRtt() / 4
+		if delay < MinAckDelay {
+			delay = MinAckDelay
+		}
+		if delay > MaxAckDelay {
+			delay = MaxAckDelay
+		}
+		src, dst := pkt.SourceStreamID, pkt.DestinationStreamID
+		c.ackTimer = c.clk.AfterFunc(delay, func() { c.ackTimerFired(src, dst) })
+	}
+	c.ackMu.Unlock()
+}
+
+// ackTimerFired flushes whatever is pending when the ACK timer elapses.
+func (c *Connection) ackTimerFired(srcStreamID, dstStreamID uint32) {
+	c.ackMu.Lock()
+	c.ackTimer = nil
+	if c.ackPending == 0 {
+		c.ackMu.Unlock()
+		return
+	}
+	frame := c.takeAckLocked(c.clk.Now())
+	c.ackMu.Unlock()
+	c.sendPacket(srcStreamID, dstStreamID, []Frame{frame})
+}
+
+// takeAckLocked builds the ACK for everything received, clears the pending
+// count and disarms the timer. Called with ackMu held.
+func (c *Connection) takeAckLocked(now time.Time) *AckFrame {
+	c.ackPending = 0
+	if c.ackTimer != nil {
+		c.ackTimer.Stop()
+		c.ackTimer = nil
+	}
+	var delay uint16
+	if !c.largestArrival.IsZero() {
+		if d := now.Sub(c.largestArrival) / time.Millisecond; d > 0 {
+			if d > 65535 {
+				d = 65535
+			}
+			delay = uint16(d)
+		}
+	}
+	return c.recvd.frame(delay)
+}
+
+// buildAckFrame is the frame that would acknowledge everything received so
+// far, with latestSeq recorded first. It is the shape tests and the Dart
+// parser agree on; the send path goes through noteReceived.
 func (c *Connection) buildAckFrame(latestSeq uint32) *AckFrame {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// No data packets received yet — send simple ACK for the current packet
-	if len(c.recvdDataSeqs) == 0 || latestSeq == 0 {
-		return &AckFrame{
-			LargestAcked:        latestSeq,
-			AckDelay:            0,
-			FirstAckRangeLength: 1,
-		}
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	if latestSeq > 0 {
+		c.recvd.add(latestSeq)
 	}
-
-	// Find the largest received sequence
-	largest := latestSeq
-	for seq := range c.recvdDataSeqs {
-		if seq > largest {
-			largest = seq
-		}
-	}
-
-	// Build first range: count consecutive seqs downward from largest
-	firstRangeLen := uint32(0)
-	cursor := largest
-	for {
-		if _, ok := c.recvdDataSeqs[cursor]; ok {
-			firstRangeLen++
-			if cursor == 0 {
-				break
-			}
-			cursor--
-		} else {
-			break
-		}
-	}
-
-	frame := &AckFrame{
-		LargestAcked:        largest,
-		AckDelay:            0,
-		FirstAckRangeLength: firstRangeLen,
-	}
-
-	// Build additional SACK ranges (max 5).
-	// cursor is now the first missing seq below the first range.
-	for len(frame.AckRanges) < 5 && cursor > 0 {
-		// Count gap (consecutive missing seqs)
-		gap := uint8(0)
-		for cursor > 0 {
-			if _, ok := c.recvdDataSeqs[cursor]; !ok {
-				gap++
-				cursor--
-				if gap == 255 {
-					break
-				}
-			} else {
-				break
-			}
-		}
-		if gap == 0 {
-			break
-		}
-
-		// Count acked range (consecutive received seqs)
-		rangeLen := uint32(0)
-		for {
-			if _, ok := c.recvdDataSeqs[cursor]; ok {
-				rangeLen++
-				if cursor == 0 {
-					break
-				}
-				cursor--
-			} else {
-				break
-			}
-		}
-		if rangeLen == 0 {
-			break
-		}
-
-		frame.AckRanges = append(frame.AckRanges, AckRange{
-			Gap:            gap,
-			AckRangeLength: rangeLen,
-		})
-	}
-
-	// Prune old entries to bound memory
-	if len(c.recvdDataSeqs) > 500 {
-		threshold := largest - 500
-		for seq := range c.recvdDataSeqs {
-			if seq < threshold {
-				delete(c.recvdDataSeqs, seq)
-			}
-		}
-	}
-
-	return frame
+	return c.recvd.frame(0)
 }
 
 func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
@@ -830,15 +838,28 @@ func (c *Connection) handleStreamFrame(pkt *Packet, f *StreamFrame) {
 
 func (c *Connection) handleAckFrame(f *AckFrame) {
 	acked := c.pm.HandleAckFrame(f)
-	for _, pkt := range acked {
-		// Only the largest newly-acked packet yields an RTT sample and drives
-		// the window increase (RFC 9002 section 5.1); the rest just release
-		// their inflight bytes.
-		isLargest := pkt.Sequence == f.LargestAcked
-		c.cc.OnPacketAcked(pkt.Size, pkt.SentTime, time.Duration(f.AckDelay)*time.Millisecond,
-			isLargest, int(f.LargestAcked))
-	}
 	if len(acked) > 0 {
+		// One controller update per frame, with every byte the frame newly
+		// acknowledges (RFC 9002 section 7.3.1: the window grows by the bytes
+		// acked, not per packet). The largest newly-acked packet, if the
+		// frame's largest is new, supplies the RTT sample (section 5.1). This
+		// used to grow the window by the largest packet's size only, which
+		// was invisible while every packet drew its own ACK and would have
+		// halved slow start once a receiver acknowledged every second one.
+		bytes := 0
+		var largest *SentPacket
+		for _, pkt := range acked {
+			bytes += pkt.Size
+			if pkt.Sequence == f.LargestAcked {
+				largest = pkt
+			}
+		}
+		var sentTime time.Time
+		if largest != nil {
+			sentTime = largest.SentTime
+		}
+		c.cc.OnPacketAcked(bytes, sentTime, time.Duration(f.AckDelay)*time.Millisecond,
+			largest != nil, int(f.LargestAcked))
 		c.sendCredit.Broadcast()
 	}
 

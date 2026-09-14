@@ -19,6 +19,10 @@ type Packet struct {
 	// Metadata (not serialized)
 	SentTime time.Time
 	IsAcked  bool
+
+	// wireLen is the size of the datagram this packet was decoded from, so
+	// the receive path can count bytes without re-encoding the packet.
+	wireLen int
 }
 
 // minHeaderLen is the minimum header size: version(4) + dcidLen(1) + scidLen(1) + seq(4) + dstStream(4) + srcStream(4)
@@ -151,5 +155,6 @@ func UnmarshalPacket(data []byte) (*Packet, error) {
 		DestinationStreamID: dstStreamID,
 		SourceStreamID:      srcStreamID,
 		Frames:              frames,
+		wireLen:             len(data),
 	}, nil
 }
