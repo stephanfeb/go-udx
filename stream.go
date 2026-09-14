@@ -81,10 +81,12 @@ type Stream struct {
 // streamConn is the interface a stream needs from its parent connection.
 type streamConn interface {
 	sendStreamFrame(streamID uint32, remoteID uint32, offset uint64, data []byte, isFin bool, isSyn bool)
+	sendStreamFrames(streamID uint32, remoteID uint32, offset uint64, data []byte, chunkSize int, isSyn bool)
 	sendResetStream(streamID uint32, remoteID uint32, errorCode uint32)
 	sendWindowUpdate(streamID uint32, remoteID uint32, maxStreamData int64)
 	sendStreamDataBlocked(streamID uint32, remoteID uint32, limit int64)
 	awaitSendCredit(size int, deadline time.Time) bool
+	awaitSendCreditUpTo(minSize, maxSize int, deadline time.Time) (int, bool)
 	clock() Clock
 }
 
@@ -234,25 +236,27 @@ func (s *Stream) Write(p []byte) (int, error) {
 			s.waitWithDeadline(s.sendCond, s.blockedWakeupLocked())
 		}
 
-		// Fragment by MTU, clamped to the credit the peer has actually granted.
-		// Without the clamp a chunk can overshoot the advertised offset by up to
-		// a full chunk, which the peer is entitled to treat as a flow-control
-		// violation.
+		// Fragment by MTU, and clamp the batch to the credit the peer has
+		// actually granted. Without the clamp a chunk can overshoot the
+		// advertised offset by up to a full chunk, which the peer is entitled
+		// to treat as a flow-control violation.
 		chunkSize := MaxDatagramSize - 100 // conservative header overhead
-		if chunkSize > len(data) {
-			chunkSize = len(data)
+		want := len(data)
+		if want > sendBatchMax*chunkSize {
+			want = sendBatchMax * chunkSize
 		}
 		if s.streamFC != nil {
-			if avail := s.streamFC.SendWindowAvailable(); avail < int64(chunkSize) {
-				chunkSize = int(avail)
+			if avail := s.streamFC.SendWindowAvailable(); avail < int64(want) {
+				want = int(avail)
 			}
 		}
-		if chunkSize == 0 {
+		if want == 0 {
 			continue // no credit; back to the wait loop
 		}
-
-		chunk := make([]byte, chunkSize)
-		copy(chunk, data[:chunkSize])
+		first := chunkSize
+		if first > want {
+			first = want
+		}
 
 		conn := s.conn
 		id, remoteID := s.ID, s.RemoteID
@@ -261,18 +265,25 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 		s.mu.Unlock()
 
-		// Wait for congestion-window and pacing credit before committing the
-		// chunk. Done outside s.mu, and before the flow-control accounting, so a
-		// congestion-limited writer does not hold the stream lock or book bytes
-		// it may never send.
-		if conn != nil && !conn.awaitSendCredit(chunkSize, deadline) {
-			s.mu.Lock()
-			if s.state == StreamStateReset {
+		// Wait for congestion-window and pacing credit for one chunk, then
+		// take as many whole chunks as the window admits now, up to
+		// sendBatchMax: they leave in one batch write. Done outside s.mu,
+		// and before the flow-control accounting, so a congestion-limited
+		// writer does not hold the stream lock or book bytes it may never
+		// send.
+		granted := want
+		if conn != nil {
+			var ok bool
+			granted, ok = conn.awaitSendCreditUpTo(first, want, deadline)
+			if !ok {
+				s.mu.Lock()
+				if s.state == StreamStateReset {
+					s.mu.Unlock()
+					return total, ErrStreamReset
+				}
 				s.mu.Unlock()
-				return total, ErrStreamReset
+				return total, ErrDeadlineExceeded
 			}
-			s.mu.Unlock()
-			return total, ErrDeadlineExceeded
 		}
 
 		s.mu.Lock()
@@ -280,11 +291,21 @@ func (s *Stream) Write(p []byte) (int, error) {
 			s.mu.Unlock()
 			return total, ErrStreamReset
 		}
-		// Re-check the send window: awaitSendCredit released s.mu, so a
+		// Re-check the send window: awaitSendCreditUpTo released s.mu, so a
 		// concurrent writer on this stream may have consumed the credit that
-		// chunkSize was clamped against.
-		if s.streamFC != nil && !s.streamFC.CanSend(chunkSize) {
+		// the batch was clamped against.
+		if s.streamFC != nil {
+			if avail := s.streamFC.SendWindowAvailable(); avail < int64(granted) {
+				granted = int(avail)
+			}
+		}
+		if granted == 0 {
 			continue // back to the flow-control wait loop with the lock held
+		}
+		// Mid-stream, send whole chunks only; a short datagram belongs at
+		// the end of the data, not in the middle of it.
+		if granted < len(data) && granted > chunkSize {
+			granted -= granted % chunkSize
 		}
 		if isSyn && s.state == StreamStateIdle {
 			s.state = StreamStateOpen
@@ -293,22 +314,26 @@ func (s *Stream) Write(p []byte) (int, error) {
 		}
 
 		if s.streamFC != nil {
-			s.streamFC.OnDataSent(chunkSize)
+			s.streamFC.OnDataSent(granted)
 		}
 
-		// The chunk's position in the stream is where the write had reached
+		// The batch's position in the stream is where the write had reached
 		// before it, which is what the peer reassembles on.
 		offset := uint64(s.BytesWritten)
-		s.BytesWritten += int64(chunkSize)
+		s.BytesWritten += int64(granted)
 		s.mu.Unlock()
 
-		// Send without holding s.mu to avoid deadlock with c.mu
+		// Send without holding s.mu to avoid deadlock with c.mu. The copy is
+		// the connection's: the frames keep it for retransmission after this
+		// call returns and the caller reuses p.
 		if conn != nil {
-			conn.sendStreamFrame(id, remoteID, offset, chunk, false, isSyn)
+			buf := make([]byte, granted)
+			copy(buf, data[:granted])
+			conn.sendStreamFrames(id, remoteID, offset, buf, chunkSize, isSyn)
 		}
 
-		data = data[chunkSize:]
-		total += chunkSize
+		data = data[granted:]
+		total += granted
 
 		s.mu.Lock()
 	}

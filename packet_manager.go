@@ -24,8 +24,8 @@ type PacketManager struct {
 	mu    sync.Mutex
 
 	// Sequence tracking
-	nextSeq          uint32
-	lastSentSeq      int // -1 if nothing sent
+	nextSeq     uint32
+	lastSentSeq int // -1 if nothing sent
 
 	// Sent packets awaiting ACK, keyed by their CURRENT sequence number. A
 	// retransmission re-keys its packet under a fresh sequence (see Retransmit),
@@ -43,13 +43,13 @@ type PacketManager struct {
 	// OnRetransmit puts a packet back on the wire. By the time it is called the
 	// packet's Sequence has already been advanced to a fresh number, so the
 	// callback only marshals and sends.
-	OnRetransmit func(pkt *SentPacket)
+	OnRetransmit func(pkt *SentPacket, seq uint32)
 }
 
 // NewPacketManager creates a new packet manager.
 func NewPacketManager(clock Clock, cc *CongestionController) *PacketManager {
 	return &PacketManager{
-		clock:              clock,
+		clock:            clock,
 		nextSeq:          0,
 		lastSentSeq:      -1,
 		sentPackets:      make(map[uint32]*SentPacket),
@@ -374,9 +374,9 @@ func (pm *PacketManager) scheduleRetransmission(pkt *SentPacket) {
 // and puts it back on the wire. A timer-driven resend is a probe, so it leaves
 // the congestion window alone — only ACK-based loss detection contracts it.
 func (pm *PacketManager) onRetransmitTimer(pkt *SentPacket) {
-	if _, ok := pm.Retransmit(pkt); ok {
+	if newSeq, ok := pm.Retransmit(pkt); ok {
 		if pm.OnRetransmit != nil {
-			pm.OnRetransmit(pkt)
+			pm.OnRetransmit(pkt, newSeq)
 		}
 	}
 }

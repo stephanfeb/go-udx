@@ -67,6 +67,24 @@ func (m *mockStreamConn) sendStreamDataBlocked(streamID, remoteID uint32, limit 
 
 func (m *mockStreamConn) awaitSendCredit(size int, deadline time.Time) bool { return true }
 
+func (m *mockStreamConn) awaitSendCreditUpTo(minSize, maxSize int, deadline time.Time) (int, bool) {
+	return maxSize, true
+}
+
+// sendStreamFrames records the batch as the chunks it would put on the wire.
+func (m *mockStreamConn) sendStreamFrames(streamID, remoteID uint32, offset uint64, data []byte, chunkSize int, isSyn bool) {
+	for len(data) > 0 {
+		k := chunkSize
+		if k > len(data) {
+			k = len(data)
+		}
+		m.sendStreamFrame(streamID, remoteID, offset, data[:k], false, isSyn)
+		isSyn = false
+		offset += uint64(k)
+		data = data[k:]
+	}
+}
+
 func (m *mockStreamConn) clock() Clock { return m.clk }
 
 func newTestStream(t *testing.T) (*Stream, *mockStreamConn) {

@@ -58,6 +58,19 @@ const (
 	// builder remembers (recvTracker).
 	ackHistory = 512
 
+	// sendBatchMax is how many STREAM chunks one Write hands the socket at a
+	// time: they go out in one batch write (sendmmsg on Linux), and the
+	// congestion window is asked for them together. Sixteen chunks is
+	// 22 KB, about the burst QUIC pacers allow, and the initial window is
+	// ten chunks, so an unopened window still sends what it may.
+	sendBatchMax = 16
+
+	// inboundQueue is how many decoded packets a connection can have waiting
+	// for its goroutine before the read loop drops new ones for it. Dropping
+	// is what the socket would do if the loop fell behind; loss recovery
+	// covers it either way. 512 packets is about 700 KB of a bulk stream.
+	inboundQueue = 512
+
 	AckDelayExponent = 3
 )
 

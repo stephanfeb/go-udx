@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,8 +73,15 @@ type Connection struct {
 	bytesReceived int64
 	addrValidated bool
 
-	// Packet sending
-	sendFunc func(data []byte, addr net.Addr) error
+	// Packet sending. sendBatchFunc, when the multiplexer provides it, sends
+	// several datagrams in as few syscalls as the platform allows.
+	sendFunc      func(data []byte, addr net.Addr) error
+	sendBatchFunc func(bufs [][]byte, addr net.Addr) error
+
+	// inbound is the queue the multiplexer's read loop hands packets to;
+	// inboundLoop handles them on this connection's own goroutine.
+	inbound        chan *Packet
+	inboundDropped int64 // atomic
 
 	// Cleanup callback (set by multiplexer to remove from connection map)
 	onClose func()
@@ -118,6 +126,7 @@ func NewConnection(
 		pmtud:             NewPMTUDController(),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:          sendFunc,
+		inbound:           make(chan *Packet, inboundQueue),
 		closeCh:           make(chan struct{}),
 	}
 
@@ -149,6 +158,7 @@ func NewConnection(
 
 	c.startIdleTimer()
 
+	go c.inboundLoop()
 	return c
 }
 
@@ -537,12 +547,17 @@ func (c *Connection) sendFrames(frames []Frame) {
 // No OnPacketSent: the bytes were charged to the congestion window at their
 // first transmission and remain in flight until acknowledged. A retransmission
 // carries the same bytes, so counting it again would double-charge one packet.
-func (c *Connection) retransmitPacket(pkt *SentPacket) {
+func (c *Connection) retransmitPacket(pkt *SentPacket, seq uint32) {
+	// seq is passed rather than read from pkt.Sequence: Retransmit assigns it
+	// under the packet manager's lock and this send runs unlocked, so reading
+	// the field here would race a concurrent re-key of the same packet (an RTO
+	// timer firing while the ACK path also retransmits it). The frames and
+	// stream IDs are fixed once the packet is first sent, so those are safe.
 	rePkt := &Packet{
 		Version:             VersionCurrent,
 		DestinationCID:      c.remoteCID,
 		SourceCID:           c.localCID,
-		Sequence:            pkt.Sequence, // the fresh sequence assigned by Retransmit
+		Sequence:            seq,
 		DestinationStreamID: pkt.DestinationStreamID,
 		SourceStreamID:      pkt.SourceStreamID,
 		Frames:              pkt.Frames,
@@ -637,14 +652,17 @@ func (c *Connection) noteReceived(pkt *Packet) {
 		}
 	}
 
+	// Every data-bearing packet is recorded, sequence 0 included: the packet
+	// manager numbers from 0, so the first data packet of a connection (the
+	// SYN) carries 0, and only control packets (never data-bearing, never
+	// acknowledged) reuse it. A guard here against 0 left that first packet
+	// unacknowledged once anything else had arrived, and its retransmissions
+	// with it.
 	c.ackMu.Lock()
-	outOfOrder := false
-	if seq > 0 {
-		hadAny, before := c.recvd.any, c.recvd.largest
-		outOfOrder = c.recvd.add(seq)
-		if !hadAny || c.recvd.largest != before {
-			c.largestArrival = now
-		}
+	hadAny, before := c.recvd.any, c.recvd.largest
+	outOfOrder := c.recvd.add(seq)
+	if !hadAny || c.recvd.largest != before {
+		c.largestArrival = now
 	}
 	c.ackPending++
 	if outOfOrder || edge || c.ackPending >= AckElicitingThreshold {
@@ -706,10 +724,127 @@ func (c *Connection) takeAckLocked(now time.Time) *AckFrame {
 func (c *Connection) buildAckFrame(latestSeq uint32) *AckFrame {
 	c.ackMu.Lock()
 	defer c.ackMu.Unlock()
-	if latestSeq > 0 {
-		c.recvd.add(latestSeq)
-	}
+	c.recvd.add(latestSeq)
 	return c.recvd.frame(0)
+}
+
+// enqueue hands a decoded packet to this connection's goroutine. It is what
+// the multiplexer's read loop calls, so the loop never runs a connection's
+// frame handling or sends. A full queue drops the packet: it is UDP, and
+// loss recovery covers a packet the socket could just as well have dropped.
+func (c *Connection) enqueue(pkt *Packet) {
+	select {
+	case c.inbound <- pkt:
+	default:
+		atomic.AddInt64(&c.inboundDropped, 1)
+	}
+}
+
+// inboundLoop handles queued packets in arrival order until the connection
+// closes.
+func (c *Connection) inboundLoop() {
+	for {
+		select {
+		case pkt := <-c.inbound:
+			c.HandlePacket(pkt)
+		case <-c.closeCh:
+			return
+		}
+	}
+}
+
+// InboundDropped is how many packets the read loop dropped for this
+// connection because its queue was full.
+func (c *Connection) InboundDropped() int64 { return atomic.LoadInt64(&c.inboundDropped) }
+
+// awaitSendCreditUpTo waits like awaitSendCredit for minSize bytes of
+// congestion-window and pacing credit, then grants as much as the window
+// admits right now, up to maxSize. The bytes are not booked here: the
+// caller sends them, and OnPacketSent books each packet.
+func (c *Connection) awaitSendCreditUpTo(minSize, maxSize int, deadline time.Time) (int, bool) {
+	if !c.awaitSendCredit(minSize, deadline) {
+		return 0, false
+	}
+	granted := c.cc.Available()
+	if granted > maxSize {
+		granted = maxSize
+	}
+	if granted < minSize {
+		granted = minSize
+	}
+	return granted, true
+}
+
+// sendStreamFrames sends data as consecutive STREAM frames of at most
+// chunkSize bytes from offset, isSyn on the first, in one batch write where
+// the socket allows (sendBatchFunc). Each packet is sequenced, tracked and
+// booked exactly as sendPacket does; only the syscalls are shared. data must
+// be the connection's own copy: the frames keep it for retransmission.
+func (c *Connection) sendStreamFrames(streamID, remoteID uint32, offset uint64, data []byte, chunkSize int, isSyn bool) {
+	bufs := make([][]byte, 0, (len(data)+chunkSize-1)/chunkSize)
+	for len(data) > 0 {
+		k := chunkSize
+		if k > len(data) {
+			k = len(data)
+		}
+		frame := &StreamFrame{IsSyn: isSyn, Offset: offset, Data: data[:k]}
+		isSyn = false
+		if buf, ok := c.prepareDataPacket(remoteID, streamID, []Frame{frame}); ok {
+			bufs = append(bufs, buf)
+		}
+		offset += uint64(k)
+		data = data[k:]
+	}
+	c.writeDatagrams(bufs)
+}
+
+// prepareDataPacket sequences, encodes, tracks and books one data-bearing
+// packet and returns its bytes, or false if the anti-amplification limit
+// says it may not be sent.
+func (c *Connection) prepareDataPacket(dstStreamID, srcStreamID uint32, frames []Frame) ([]byte, bool) {
+	seq := c.pm.NextSequence()
+	pkt := &Packet{
+		Version:             VersionCurrent,
+		DestinationCID:      c.remoteCID,
+		SourceCID:           c.localCID,
+		Sequence:            seq,
+		DestinationStreamID: dstStreamID,
+		SourceStreamID:      srcStreamID,
+		Frames:              frames,
+	}
+	data := MarshalPacket(pkt)
+	c.pm.SendPacket(&SentPacket{
+		Sequence:            seq,
+		Size:                len(data),
+		Frames:              frames,
+		DestinationStreamID: dstStreamID,
+		SourceStreamID:      srcStreamID,
+	})
+	c.cc.OnPacketSent(len(data))
+	c.cc.Pacer.OnPacketSent(len(data))
+
+	c.mu.Lock()
+	if !c.addrValidated && c.bytesSent+int64(len(data)) > c.bytesReceived*AmplificationFactor {
+		c.mu.Unlock()
+		return nil, false // anti-amplification limit
+	}
+	c.bytesSent += int64(len(data))
+	c.mu.Unlock()
+	return data, true
+}
+
+// writeDatagrams puts encoded packets on the wire, batched where the socket
+// allows.
+func (c *Connection) writeDatagrams(bufs [][]byte) {
+	switch {
+	case len(bufs) == 0:
+	case c.sendBatchFunc != nil && len(bufs) > 1:
+		c.sendBatchFunc(bufs, c.remoteAddr)
+	case c.sendFunc != nil:
+		for _, b := range bufs {
+			c.sendFunc(b, c.remoteAddr)
+		}
+	}
 }
 
 func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
@@ -875,8 +1010,8 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 	for _, seq := range lost {
 		if pkt := c.pm.GetPacket(seq); pkt != nil {
 			c.cc.OnCongestionEvent()
-			if _, ok := c.pm.Retransmit(pkt); ok {
-				c.retransmitPacket(pkt)
+			if newSeq, ok := c.pm.Retransmit(pkt); ok {
+				c.retransmitPacket(pkt, newSeq)
 			}
 		}
 	}

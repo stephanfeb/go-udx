@@ -39,9 +39,9 @@ type CongestionController struct {
 	highestCumulativeAck int
 
 	// Recovery state
-	inRecovery            bool
-	recoveryEndSeq        int
-	lostPacketInRecovery  int
+	inRecovery           bool
+	recoveryEndSeq       int
+	lostPacketInRecovery int
 
 	// PTO
 	ptoTimer      *time.Timer
@@ -163,6 +163,16 @@ func (cc *CongestionController) CanSend(bytes int) bool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return cc.inflight+bytes <= cc.cwnd
+}
+
+// Available is how many more bytes the window admits right now.
+func (cc *CongestionController) Available() int {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.inflight >= cc.cwnd {
+		return 0
+	}
+	return cc.cwnd - cc.inflight
 }
 
 // OnPacketSent is called when a packet is sent.

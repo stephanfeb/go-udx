@@ -179,7 +179,7 @@ func TestCongestion_RetransmitDoesNotDoubleCountInflight(t *testing.T) {
 		t.Fatal("sent data packet is not tracked by the packet manager")
 	}
 	for i := 0; i < 5; i++ {
-		c.retransmitPacket(pkt)
+		c.retransmitPacket(pkt, pkt.Sequence)
 	}
 
 	if got := c.cc.Inflight(); got != afterSend {

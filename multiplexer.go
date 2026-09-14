@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // earlyPacket holds a packet that arrived before its connection's SYN.
@@ -19,6 +21,7 @@ type earlyPacket struct {
 type Multiplexer struct {
 	mu   sync.Mutex
 	conn net.PacketConn
+	io   *datagramIO
 	clk  Clock
 
 	// CID -> Connection routing
@@ -41,6 +44,7 @@ type Multiplexer struct {
 func NewMultiplexer(conn net.PacketConn, clk Clock) *Multiplexer {
 	m := &Multiplexer{
 		conn:         conn,
+		io:           newDatagramIO(conn),
 		clk:          clk,
 		connections:  make(map[string]*Connection),
 		earlyPackets: make(map[string][]earlyPacket),
@@ -82,6 +86,7 @@ func (m *Multiplexer) Dial(ctx context.Context, addr net.Addr) (*Connection, err
 			return err
 		})
 
+	c.sendBatchFunc = m.io.writeAll
 	cidKey := localCID.String()
 	c.onClose = func() { m.removeConnection(cidKey) }
 
@@ -167,8 +172,16 @@ func (m *Multiplexer) idleTimeoutLoop() {
 	}
 }
 
+// readLoop is the socket's one reader. It decodes and routes; a connection's
+// packets are handled on that connection's own goroutine (Connection.inbound),
+// so the loop never sends, copies stream data or takes a connection's locks,
+// and one socket is not bounded by one core. Datagrams come in batches where
+// the platform allows (datagramIO).
 func (m *Multiplexer) readLoop() {
-	buf := make([]byte, MaxMTU+100)
+	ms := make([]ipv4.Message, readBatchSize)
+	for i := range ms {
+		ms[i].Buffers = [][]byte{make([]byte, MaxMTU+100)}
+	}
 	for {
 		select {
 		case <-m.closeCh:
@@ -176,7 +189,7 @@ func (m *Multiplexer) readLoop() {
 		default:
 		}
 
-		n, addr, err := m.conn.ReadFrom(buf)
+		n, err := m.io.readMessages(ms)
 		if err != nil {
 			select {
 			case <-m.closeCh:
@@ -185,11 +198,14 @@ func (m *Multiplexer) readLoop() {
 				continue
 			}
 		}
-
-		data := make([]byte, n)
-		copy(data, buf[:n])
-
-		m.handleDatagram(data, addr)
+		for i := 0; i < n; i++ {
+			// The packet keeps slices of its buffer (stream data is not
+			// copied out of it), so it gets a buffer of its own and the
+			// batch buffer is reused.
+			data := make([]byte, ms[i].N)
+			copy(data, ms[i].Buffers[0][:ms[i].N])
+			m.handleDatagram(data, ms[i].Addr)
+		}
 	}
 }
 
@@ -218,7 +234,7 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	m.mu.Unlock()
 
 	if ok {
-		c.HandlePacket(pkt)
+		c.enqueue(pkt)
 		return
 	}
 
@@ -256,6 +272,7 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 			_, err := m.conn.WriteTo(data, addr)
 			return err
 		})
+	newConn.sendBatchFunc = m.io.writeAll
 	newConn.onClose = func() { m.removeConnection(cidKey) }
 	newConn.mu.Lock()
 	newConn.state = ConnStateEstablished
@@ -270,11 +287,11 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	m.mu.Unlock()
 
 	// Deliver the SYN packet first
-	newConn.HandlePacket(pkt)
+	newConn.enqueue(pkt)
 
 	// Replay early packets in arrival order
 	for _, ep := range early {
-		newConn.HandlePacket(ep.pkt)
+		newConn.enqueue(ep.pkt)
 	}
 
 	// Notify acceptor
