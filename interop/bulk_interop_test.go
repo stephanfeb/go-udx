@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -25,10 +26,23 @@ import (
 
 const dartPeerDir = "dartpeer"
 
+// bulkPeerEnv names a command that replaces `dart run bin/bulk_peer.dart` for
+// the bulk and multi-stream suites, so another implementation speaking the
+// same CLI and stderr protocol can be driven by them. js-udx ships one:
+//
+//	UDX_BULK_PEER="node /path/to/js-udx/tools/bulk-peer/bulk-peer.mjs" go test ./interop -run 'TestBulk|TestMultiStream'
+//
+// The command is split on spaces; the mode, port, size and stream count follow.
+const bulkPeerEnv = "UDX_BULK_PEER"
+
 // requireDartPeer skips unless the Dart toolchain and the peer package are both
-// usable, so the suite stays runnable without a Dart install.
+// usable, so the suite stays runnable without a Dart install. A peer named by
+// UDX_BULK_PEER needs neither.
 func requireDartPeer(t *testing.T) {
 	t.Helper()
+	if os.Getenv(bulkPeerEnv) != "" {
+		return
+	}
 	if _, err := exec.LookPath("dart"); err != nil {
 		t.Skip("dart not on PATH; skipping Go<->Dart bulk interop")
 	}
@@ -50,12 +64,15 @@ type peerResult struct {
 func startDartPeer(t *testing.T, ctx context.Context, mode string, port, total int, streams ...int) <-chan peerResult {
 	t.Helper()
 
-	script := filepath.Join(dartPeerDir, "bin", "bulk_peer.dart")
-	argv := []string{"run", script, mode, strconv.Itoa(port), strconv.Itoa(total)}
+	argv := []string{"dart", "run", filepath.Join(dartPeerDir, "bin", "bulk_peer.dart")}
+	if custom := strings.Fields(os.Getenv(bulkPeerEnv)); len(custom) > 0 {
+		argv = custom
+	}
+	argv = append(argv, mode, strconv.Itoa(port), strconv.Itoa(total))
 	if len(streams) > 0 {
 		argv = append(argv, strconv.Itoa(streams[0]))
 	}
-	cmd := exec.CommandContext(ctx, "dart", argv...)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
