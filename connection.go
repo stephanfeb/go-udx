@@ -613,21 +613,39 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		c.handleFrame(pkt, frame)
 	}
 
-	if !isDataBearing(pkt) {
+	if !isDataBearing(pkt) && !isNumberedPing(pkt) {
 		return
 	}
 
-	// Only data-bearing packets are acknowledged. Acknowledging control-only
-	// packets makes every ACK provoke an ACK in return, which ping-pongs
-	// without end: a 64KB transfer measured ~176,000 ack-only datagrams for 48
-	// data packets before this guard existed. It is also the correct rule
-	// independently — sendPacket only registers data-bearing packets with the
-	// packet manager, so an ACK for a control packet can never match anything
-	// in flight.
+	// Only data-bearing packets and numbered PINGs are acknowledged.
+	// Acknowledging other control-only packets makes every ACK provoke an ACK
+	// in return, which ping-pongs without end: a 64KB transfer measured
+	// ~176,000 ack-only datagrams for 48 data packets before this guard
+	// existed. It is also the correct rule independently — sendPacket only
+	// registers data-bearing packets with the packet manager, so an ACK for a
+	// control packet can never match anything in flight.
 	c.noteReceived(pkt)
 }
 
-// noteReceived records a data-bearing packet and decides whether to
+// isNumberedPing reports whether a packet carries a PING under a nonzero
+// sequence. Peers that track their PINGs (dart-udx and js-udx keepalives and
+// path-MTU probes) number them from their data sequence space and wait for the
+// ACK; left unanswered, their liveness checks fail and MTU discovery never
+// rises above the floor. go-udx's own control packets, PINGs included, go out
+// under sequence 0 and stay unacknowledged, so an ACK still never elicits one.
+func isNumberedPing(pkt *Packet) bool {
+	if pkt.Sequence == 0 {
+		return false
+	}
+	for _, f := range pkt.Frames {
+		if _, ok := f.(*PingFrame); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// noteReceived records an acknowledged packet and decides whether to
 // acknowledge now or later (RFC 9000 section 13.2). ACKs reflect *receipt*,
 // not delivery: a packet buffered ahead of a gap is still safely held, and
 // reporting it lets the peer retransmit only what is genuinely missing.
@@ -635,8 +653,8 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 // Now: the packet is out of order (the sender should learn of the gap
 // without waiting), or it opens or closes a stream (a SYN is what a dial or
 // stream open is waiting on; a FIN's ACK lets the sender retire the stream),
-// or it is the AckElicitingThreshold-th unacknowledged packet. Later: the
-// ACK timer, a quarter of the smoothed RTT within [MinAckDelay, MaxAckDelay],
+// or it carries a PING (the sender is timing the answer), or it is the
+// AckElicitingThreshold-th unacknowledged packet. Later: the ACK timer, a quarter of the smoothed RTT within [MinAckDelay, MaxAckDelay],
 // and the frame reports how long it waited so the sender's RTT sample stays
 // honest. Every packet used to be acknowledged on arrival, which doubled the
 // datagrams a receiver handles and, on the server, saturated the single read
@@ -647,6 +665,12 @@ func (c *Connection) noteReceived(pkt *Packet) {
 	edge := false
 	for _, f := range pkt.Frames {
 		if sf, ok := f.(*StreamFrame); ok && (sf.IsSyn || sf.IsFin) {
+			edge = true
+			break
+		}
+		// A PING is waiting on its ACK to measure liveness or a probe size;
+		// delaying it only inflates the answer.
+		if _, ok := f.(*PingFrame); ok {
 			edge = true
 			break
 		}
@@ -862,7 +886,7 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 	case *ConnectionCloseFrame:
 		c.Close()
 	case *PingFrame:
-		// Respond with ACK (handled by packet-level ACK)
+		// Answered by the packet-level ACK when numbered (see isNumberedPing).
 	case *PathChallengeFrame:
 		c.sendFrames([]Frame{&PathResponseFrame{Data: f.Data}})
 	case *PathResponseFrame:
