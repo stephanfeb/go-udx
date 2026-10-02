@@ -242,3 +242,66 @@ func TestRecvTracker_JumpClearsTheSlotsItPasses(t *testing.T) {
 		t.Fatalf("frame after 1..10,14 = %+v, want run 1, gap 3, run 10", g)
 	}
 }
+
+// pingPacket is a PING-only packet under the given sequence, optionally
+// padded out to a path-MTU probe.
+func pingPacket(seq uint32, probe bool) *Packet {
+	frames := []Frame{&PingFrame{}}
+	if probe {
+		frames = append(frames, &MTUProbeFrame{ProbeSize: 64})
+	}
+	return &Packet{
+		Version:             VersionCurrent,
+		Sequence:            seq,
+		DestinationStreamID: 0,
+		SourceStreamID:      0,
+		Frames:              frames,
+	}
+}
+
+// TestAck_NumberedPingIsAckedAtOnce: dart-udx and js-udx number their PINGs
+// and MTU probes and wait for the ACK; it must come at once and cover the
+// PING's sequence.
+func TestAck_NumberedPingIsAckedAtOnce(t *testing.T) {
+	for _, probe := range []bool{false, true} {
+		c, _, sent := newAckTestConn(t)
+		c.HandlePacket(pingPacket(7, probe))
+		acks := acksIn(t, *sent)
+		if len(acks) != 1 {
+			t.Fatalf("probe=%v: PING drew %d ACKs, want 1 at once", probe, len(acks))
+		}
+		if a := acks[0]; a.LargestAcked != 7 || a.FirstAckRangeLength != 1 {
+			t.Fatalf("probe=%v: ACK = %+v, want largest 7, run 1", probe, a)
+		}
+	}
+}
+
+// TestAck_UnnumberedPingIsNotAcked: sequence 0 is what go-udx's own control
+// packets use; answering those would let control traffic elicit control
+// traffic.
+func TestAck_UnnumberedPingIsNotAcked(t *testing.T) {
+	c, _, sent := newAckTestConn(t)
+	c.HandlePacket(pingPacket(0, false))
+	c.ackTimerFired(0, 0)
+	if got := len(acksIn(t, *sent)); got != 0 {
+		t.Fatalf("seq-0 PING drew %d ACKs, want none", got)
+	}
+}
+
+// TestAck_PingKeepsDataRangesContiguous: a PING numbered between data
+// packets fills its slot, so the next data packet is in order and the ACK
+// is one run rather than a gap the sender would read as loss.
+func TestAck_PingKeepsDataRangesContiguous(t *testing.T) {
+	c, _, sent := newAckTestConn(t)
+	c.HandlePacket(ackDataPacket(1, false, false))
+	c.HandlePacket(pingPacket(2, false))
+	c.HandlePacket(ackDataPacket(3, false, false))
+	c.ackTimerFired(1, 1)
+	acks := acksIn(t, *sent)
+	if len(acks) == 0 {
+		t.Fatal("no ACKs sent")
+	}
+	if a := acks[len(acks)-1]; a.LargestAcked != 3 || a.FirstAckRangeLength != 3 || len(a.AckRanges) != 0 {
+		t.Fatalf("last ACK = %+v, want largest 3, run 3, no ranges", a)
+	}
+}
