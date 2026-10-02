@@ -19,6 +19,10 @@ import (
 type datagramIO struct {
 	pc    net.PacketConn
 	batch *ipv4.PacketConn // nil: no batching on this socket
+	// batchWrites is false on an IPv6 or dual-stack socket. ipv4.PacketConn
+	// writes IPv4 socket addresses, which an IPv6 socket rejects (sendmsg:
+	// invalid argument), even for an IPv4 peer. Reads work either way.
+	batchWrites bool
 }
 
 // readBatchSize is how many datagrams one read call may return, and how many
@@ -29,6 +33,11 @@ func newDatagramIO(pc net.PacketConn) *datagramIO {
 	d := &datagramIO{pc: pc}
 	if uc, ok := pc.(*net.UDPConn); ok {
 		d.batch = ipv4.NewPacketConn(uc)
+		// udx.Dial binds an unspecified "udp" address: a dual-stack IPv6
+		// socket, whose local IP has no IPv4 form.
+		if la, ok := uc.LocalAddr().(*net.UDPAddr); ok && la.IP.To4() != nil {
+			d.batchWrites = true
+		}
 	}
 	return d
 }
@@ -51,14 +60,13 @@ func (d *datagramIO) readMessages(ms []ipv4.Message) (int, error) {
 // writeAll sends every buffer to addr, several per syscall where it can. A
 // short batch write is retried for the remainder; the kernel may accept
 // fewer than offered.
+//
+// If a batch write fails, the rest go out one per call: the caller ignores
+// the error, so failing the whole batch would silently lose every datagram in
+// it.
 func (d *datagramIO) writeAll(bufs [][]byte, addr net.Addr) error {
-	if d.batch == nil || len(bufs) == 1 {
-		for _, b := range bufs {
-			if _, err := d.pc.WriteTo(b, addr); err != nil {
-				return err
-			}
-		}
-		return nil
+	if d.batch == nil || !d.batchWrites || len(bufs) == 1 {
+		return d.writeEach(bufs, addr)
 	}
 	ms := make([]ipv4.Message, len(bufs))
 	for i, b := range bufs {
@@ -68,12 +76,22 @@ func (d *datagramIO) writeAll(bufs [][]byte, addr net.Addr) error {
 	for len(ms) > 0 {
 		n, err := d.batch.WriteBatch(ms, 0)
 		if err != nil {
-			return err
+			return d.writeEach(bufs[len(bufs)-len(ms):], addr)
 		}
 		if n <= 0 {
 			n = 1
 		}
 		ms = ms[n:]
+	}
+	return nil
+}
+
+// writeEach sends one datagram per call, stopping at the first error.
+func (d *datagramIO) writeEach(bufs [][]byte, addr net.Addr) error {
+	for _, b := range bufs {
+		if _, err := d.pc.WriteTo(b, addr); err != nil {
+			return err
+		}
 	}
 	return nil
 }
