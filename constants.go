@@ -92,6 +92,14 @@ const (
 	HandshakeTimeout = 10 * time.Second
 )
 
+// SafeDatagramSize is the largest datagram a stream's data goes out in:
+// what any internet path carries, as QUIC's 1200 (RFC 9000 section 14), so
+// it fits the 1280-byte IPv6 minimum MTU with its headers. Mobile carriers'
+// tunnels (464XLAT, GTP) carry less than 1500, and drop a larger datagram
+// that may not be fragmented: a reply of more than one full datagram then
+// never arrives, and the sender gives the connection up.
+const SafeDatagramSize = 1200
+
 // Congestion Control
 const (
 	MaxDatagramSize         = 1472

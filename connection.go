@@ -56,6 +56,12 @@ type Connection struct {
 	pathChallenge     [8]byte
 	pathChallengeResp chan [8]byte
 
+	// A new address the peer's packets came from, being checked before the
+	// connection moves there (observeAddr), under mu.
+	pendingAddr      net.Addr
+	pendingChallenge [8]byte
+	pendingSentAt    time.Time
+
 	// Receive-side acknowledgement state, under ackMu (never taken with mu
 	// held, and the timer callback takes it alone). recvd knows which
 	// data-bearing packets arrived, for the SACK ranges; ackPending counts
@@ -334,7 +340,15 @@ func (c *Connection) Ping(ctx context.Context) error {
 func (c *Connection) LocalAddr() net.Addr { return c.localAddr }
 
 // RemoteAddr returns the remote address.
-func (c *Connection) RemoteAddr() net.Addr { return c.remoteAddr }
+func (c *Connection) RemoteAddr() net.Addr { return c.peerAddr() }
+
+// peerAddr is where packets go: the peer's address, which observeAddr may
+// move.
+func (c *Connection) peerAddr() net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.remoteAddr
+}
 
 // State returns the connection state.
 func (c *Connection) State() ConnectionState {
@@ -531,7 +545,7 @@ func (c *Connection) sendPacket(dstStreamID, srcStreamID uint32, frames []Frame)
 	c.mu.Unlock()
 
 	if c.sendFunc != nil {
-		c.sendFunc(data, c.remoteAddr)
+		c.sendFunc(data, c.peerAddr())
 	}
 }
 
@@ -570,7 +584,7 @@ func (c *Connection) retransmitPacket(pkt *SentPacket, seq uint32) {
 	c.mu.Unlock()
 
 	if c.sendFunc != nil {
-		c.sendFunc(data, c.remoteAddr)
+		c.sendFunc(data, c.peerAddr())
 	}
 }
 
@@ -863,10 +877,11 @@ func (c *Connection) writeDatagrams(bufs [][]byte) {
 	switch {
 	case len(bufs) == 0:
 	case c.sendBatchFunc != nil && len(bufs) > 1:
-		c.sendBatchFunc(bufs, c.remoteAddr)
+		c.sendBatchFunc(bufs, c.peerAddr())
 	case c.sendFunc != nil:
+		addr := c.peerAddr()
 		for _, b := range bufs {
-			c.sendFunc(b, c.remoteAddr)
+			c.sendFunc(b, addr)
 		}
 	}
 }
@@ -890,6 +905,9 @@ func (c *Connection) handleFrame(pkt *Packet, frame Frame) {
 	case *PathChallengeFrame:
 		c.sendFrames([]Frame{&PathResponseFrame{Data: f.Data}})
 	case *PathResponseFrame:
+		if c.completeMigration(f.Data) {
+			break
+		}
 		select {
 		case c.pathChallengeResp <- f.Data:
 		default:
@@ -1052,6 +1070,76 @@ func (c *Connection) handleResetStream(pkt *Packet, f *ResetStreamFrame) {
 	s := c.findStream(pkt.DestinationStreamID, pkt.SourceStreamID)
 	if s != nil {
 		s.DeliverReset(f.ErrorCode)
+	}
+}
+
+// pathChallengeRetry is how long a challenge to a new address waits for its
+// answer before a packet from that address sends another.
+const pathChallengeRetry = time.Second
+
+// observeAddr is told the address each packet for this connection came
+// from. When it is not the address the connection sends to, the peer's NAT
+// has likely moved it to a new port, as a carrier NAT does after a short
+// silence: every reply to the old port is lost, and the peer, hearing
+// nothing, gives the connection up. So the new address is challenged, and
+// the connection moves there once it answers (completeMigration); replies
+// go to the old address until then (RFC 9000 section 9.3). The challenge
+// is sent from its own goroutine: the multiplexer's read loop never sends.
+func (c *Connection) observeAddr(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.remoteAddr != nil && addr.String() == c.remoteAddr.String() {
+		c.mu.Unlock()
+		return
+	}
+	now := c.clk.Now()
+	if c.pendingAddr != nil && addr.String() == c.pendingAddr.String() && now.Sub(c.pendingSentAt) < pathChallengeRetry {
+		c.mu.Unlock()
+		return
+	}
+	var challenge [8]byte
+	if _, err := rand.Read(challenge[:]); err != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.pendingAddr = addr
+	c.pendingChallenge = challenge
+	c.pendingSentAt = now
+	c.mu.Unlock()
+	go c.sendControlTo([]Frame{&PathChallengeFrame{Data: challenge}}, addr)
+}
+
+// completeMigration moves the connection to the address its challenge went
+// to, when [data] answers that challenge. The challenge was random and sent
+// only there, so an answer shows the peer is reachable at that address.
+func (c *Connection) completeMigration(data [8]byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingAddr == nil || data != c.pendingChallenge {
+		return false
+	}
+	c.remoteAddr = c.pendingAddr
+	c.addrValidated = true
+	c.pendingAddr = nil
+	return true
+}
+
+// sendControlTo sends control-only frames to [addr] rather than the
+// connection's address: a path challenge to an address not yet moved to.
+func (c *Connection) sendControlTo(frames []Frame, addr net.Addr) {
+	data := MarshalPacket(&Packet{
+		Version:        VersionCurrent,
+		DestinationCID: c.remoteCID,
+		SourceCID:      c.localCID,
+		Frames:         frames,
+	})
+	c.mu.Lock()
+	c.bytesSent += int64(len(data))
+	c.mu.Unlock()
+	if c.sendFunc != nil {
+		c.sendFunc(data, addr)
 	}
 }
 

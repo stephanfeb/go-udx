@@ -234,6 +234,7 @@ func (m *Multiplexer) handleDatagram(data []byte, addr net.Addr) {
 	m.mu.Unlock()
 
 	if ok {
+		c.observeAddr(addr)
 		c.enqueue(pkt)
 		return
 	}

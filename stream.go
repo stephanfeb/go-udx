@@ -240,7 +240,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 		// actually granted. Without the clamp a chunk can overshoot the
 		// advertised offset by up to a full chunk, which the peer is entitled
 		// to treat as a flow-control violation.
-		chunkSize := MaxDatagramSize - 100 // conservative header overhead
+		chunkSize := SafeDatagramSize - 100 // conservative header overhead
 		want := len(data)
 		if want > sendBatchMax*chunkSize {
 			want = sendBatchMax * chunkSize
