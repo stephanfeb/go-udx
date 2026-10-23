@@ -116,8 +116,27 @@ const (
 const (
 	BetaCubic                     = 0.7
 	CubicC                        = 0.4
-	PacingGain                    = 2.88
 	PersistentCongestionThreshold = 3
+)
+
+// Pacing (RFC 9002 section 7.7). The rate is gain * cwnd / smoothed_rtt;
+// section 7.7 suggests a gain of about 1.25, and slow start, where the
+// window doubles each round trip, takes 2 so that pacing does not hold the
+// window's growth back. (The gain used to be BBR's 2.88 startup gain, over
+// min_rtt, for the whole connection.)
+const (
+	PacingGain          = 1.25
+	PacingGainSlowStart = 2.0
+
+	// PacingBurstPackets is how many datagrams may go out at once without
+	// waiting on the pacer; the budget holds this many, or MinPacingDelay
+	// of the rate when that is more.
+	PacingBurstPackets = 10
+
+	// MinPacingDelay is the shortest wait the pacer asks for: a timer is
+	// not set for less, and the burst covers at least this much of the rate
+	// so a wait that overshoots by that little costs no throughput.
+	MinPacingDelay = time.Millisecond
 )
 
 // RTT estimation (RFC 9002)

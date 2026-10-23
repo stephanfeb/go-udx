@@ -23,23 +23,36 @@ type natProxy struct {
 	// may not be fragmented.
 	maxSize int
 
+	// delay, when set, holds every datagram for that long in each
+	// direction: the path's one-way latency. Each direction's datagrams are
+	// delivered in order by one goroutine (toServer, toClient), so the delay
+	// never reorders them: reordering would look like loss to the stack.
+	delay    time.Duration
+	toServer chan heldDatagram
+	toClient chan heldDatagram
+	stop     chan struct{}
+
 	mu      sync.Mutex
 	outside *net.UDPConn
 	client  net.Addr
 }
 
 // newNATProxy starts a proxy to server; maxSize, when not 0, is the
-// largest datagram it passes.
-func newNATProxy(t *testing.T, server net.Addr, maxSize int) *natProxy {
+// largest datagram it passes, and delay, when not 0, the one-way latency.
+func newNATProxy(t *testing.T, server net.Addr, maxSize int, delay time.Duration) *natProxy {
 	t.Helper()
 	inside, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &natProxy{t: t, inside: inside, server: server.(*net.UDPAddr), maxSize: maxSize}
+	p := &natProxy{t: t, inside: inside, server: server.(*net.UDPAddr), maxSize: maxSize, delay: delay,
+		toServer: make(chan heldDatagram, 4096), toClient: make(chan heldDatagram, 4096), stop: make(chan struct{})}
 	p.rebind()
 	go p.fromClient()
+	go p.deliver(p.toServer)
+	go p.deliver(p.toClient)
 	t.Cleanup(func() {
+		close(p.stop)
 		inside.Close()
 		p.mu.Lock()
 		p.outside.Close()
@@ -80,7 +93,44 @@ func (p *natProxy) fromClient() {
 		p.client = from
 		out := p.outside
 		p.mu.Unlock()
-		out.WriteTo(buf[:n], p.server)
+		p.forward(p.toServer, out, buf[:n], p.server)
+	}
+}
+
+// heldDatagram is a datagram waiting out the path's delay.
+type heldDatagram struct {
+	conn *net.UDPConn
+	data []byte
+	addr net.Addr
+	at   time.Time
+}
+
+// forward writes data to addr on conn: at once, or through queue after the
+// path's delay if it has one.
+func (p *natProxy) forward(queue chan heldDatagram, conn *net.UDPConn, data []byte, addr net.Addr) {
+	if p.delay == 0 {
+		conn.WriteTo(data, addr)
+		return
+	}
+	held := heldDatagram{conn: conn, data: append([]byte(nil), data...), addr: addr, at: time.Now().Add(p.delay)}
+	select {
+	case queue <- held:
+	case <-p.stop:
+	}
+}
+
+// deliver writes queued datagrams once their time comes, in order.
+func (p *natProxy) deliver(queue chan heldDatagram) {
+	for {
+		select {
+		case h := <-queue:
+			if d := time.Until(h.at); d > 0 {
+				time.Sleep(d)
+			}
+			h.conn.WriteTo(h.data, h.addr)
+		case <-p.stop:
+			return
+		}
 	}
 }
 
@@ -98,7 +148,7 @@ func (p *natProxy) fromServer(out *net.UDPConn) {
 		client := p.client
 		p.mu.Unlock()
 		if client != nil {
-			p.inside.WriteTo(buf[:n], client)
+			p.forward(p.toClient, p.inside, buf[:n], client)
 		}
 	}
 }
@@ -132,7 +182,7 @@ func TestConnection_SurvivesNATRebinding(t *testing.T) {
 		}
 	}()
 
-	nat := newNATProxy(t, server.Addr(), 0)
+	nat := newNATProxy(t, server.Addr(), 0, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := client.Dial(ctx, nat.addr())
@@ -208,7 +258,7 @@ func TestConnection_ReplyCrossesSmallMTUPath(t *testing.T) {
 		}
 	}()
 
-	nat := newNATProxy(t, server.Addr(), 1350-28) // a 1350-byte path, less the IPv4 and UDP headers
+	nat := newNATProxy(t, server.Addr(), 1350-28, 0) // a 1350-byte path, less the IPv4 and UDP headers
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := client.Dial(ctx, nat.addr())

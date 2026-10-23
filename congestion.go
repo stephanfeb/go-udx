@@ -60,9 +60,13 @@ type CongestionController struct {
 // NewCongestionController creates a new congestion controller.
 func NewCongestionController(clock Clock, lastSentSeqFn func() int) *CongestionController {
 	cc := &CongestionController{
-		clock:          clock,
-		cwnd:           InitialCwnd,
-		ssthresh:       65535,
+		clock: clock,
+		cwnd:  InitialCwnd,
+		// Slow start runs until the first loss (RFC 9002 section 7.3.1).
+		// This was 65535, so slow start ended at 64 KB, 44 packets, and
+		// the window crawled up from there at CUBIC's pace: on a 40 ms
+		// path 4 MB took two seconds with no loss at all.
+		ssthresh:       math.MaxInt,
 		smoothedRtt:    100 * time.Millisecond,
 		rttVar:         50 * time.Millisecond,
 		minRtt:         time.Second,
@@ -244,6 +248,18 @@ func (cc *CongestionController) OnPacketAcked(bytes int, sentTime time.Time, ack
 	if cc.inflight > 0 {
 		cc.armPtoTimer()
 	}
+	cc.updatePacingRate()
+}
+
+// updatePacingRate tells the pacer the window and RTT it paces by, once
+// an RTT sample exists; before one the pacer is unlimited and the initial
+// window is the burst. Called after every change to either. Caller holds
+// cc.mu.
+func (cc *CongestionController) updatePacingRate() {
+	if cc.firstRttSample {
+		return
+	}
+	cc.Pacer.UpdateRate(cc.cwnd, cc.smoothedRtt, cc.cwnd < cc.ssthresh)
 }
 
 // updateRtt updates RTT estimates based on a new sample.
@@ -261,10 +277,8 @@ func (cc *CongestionController) updateRtt(sentTime time.Time, ackDelay time.Dura
 		cc.latestRtt -= cappedDelay
 	}
 
-	// Update min RTT
 	if cc.latestRtt < cc.minRtt {
 		cc.minRtt = cc.latestRtt
-		cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
 	}
 
 	// RFC 9002 Section 5.1
@@ -334,7 +348,7 @@ func (cc *CongestionController) OnPersistentCongestion() {
 	cc.inRecovery = false
 	cc.recoveryEndSeq = -1
 	cc.epochStart = time.Time{}
-	cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
+	cc.updatePacingRate()
 }
 
 // PersistentCongestionDuration is how long a span of loss must cover before
@@ -390,7 +404,7 @@ func (cc *CongestionController) OnCongestionEvent() {
 	cc.k = math.Cbrt(diff)
 
 	cc.cwnd = cc.ssthresh
-	cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
+	cc.updatePacingRate()
 }
 
 // SetSmoothedRtt sets the smoothed RTT (for testing).

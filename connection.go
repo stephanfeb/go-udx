@@ -1070,11 +1070,14 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 // acknowledged for a PTO, so the oldest outstanding packets go out again
 // under fresh sequences, up to ptoProbes of them. They are not declared
 // lost (an ACK will say), their bytes stay in flight, and the window and
-// pacer are not consulted: a probe is allowed out when nothing else is.
+// pacer are not consulted: a probe is allowed out when nothing else is
+// (section 7.7 exempts probes from pacing). It is still drawn from the
+// pacing budget, so what follows it is paced as if it had been.
 func (c *Connection) onPTO() {
 	for _, pkt := range c.pm.OldestUnacked(ptoProbes) {
 		if seq, ok := c.pm.Resend(pkt); ok {
 			c.retransmitPacket(pkt, seq)
+			c.cc.Pacer.OnPacketSent(pkt.Size)
 		}
 	}
 }
