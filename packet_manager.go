@@ -24,7 +24,11 @@ type SentPacket struct {
 	DestinationStreamID uint32
 	SourceStreamID      uint32
 	RetransmitCount     int
-	LastRetransmit      time.Time
+	// Probe marks a path-MTU probe (MTUDiscovery): numbered and tracked so
+	// its ACK or loss is reported, but never re-sent, not booked in flight,
+	// and no congestion signal when lost.
+	Probe          bool
+	LastRetransmit time.Time
 }
 
 // PacketManager tracks sent packets, matches ACKs to them, and declares loss
@@ -292,7 +296,7 @@ func (pm *PacketManager) Resend(pkt *SentPacket) (uint32, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if pkt.IsAcked {
+	if pkt.IsAcked || pkt.Probe {
 		return 0, false
 	}
 	if cur, ok := pm.sentPackets[pkt.Sequence]; ok && cur == pkt {
@@ -324,6 +328,9 @@ func (pm *PacketManager) OldestUnacked(n int) []*SentPacket {
 	}
 	all := make([]*SentPacket, 0, len(pm.sentPackets))
 	for _, pkt := range pm.sentPackets {
+		if pkt.Probe {
+			continue // a path-MTU probe is never re-sent
+		}
 		all = append(all, pkt)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Sequence < all[j].Sequence })
@@ -331,6 +338,16 @@ func (pm *PacketManager) OldestUnacked(n int) []*SentPacket {
 		all = all[:n]
 	}
 	return all
+}
+
+// Drop forgets a tracked packet that is being replaced by others
+// (Connection.fitToPath), neither acknowledged nor lost.
+func (pm *PacketManager) Drop(pkt *SentPacket) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if cur, ok := pm.sentPackets[pkt.Sequence]; ok && cur == pkt {
+		delete(pm.sentPackets, pkt.Sequence)
+	}
 }
 
 // GetPacket returns a sent packet by sequence number.

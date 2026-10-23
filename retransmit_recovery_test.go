@@ -316,11 +316,13 @@ type resetCountingSink struct {
 	mu     sync.Mutex
 	resets int
 	sent   int
+	raw    [][]byte // every datagram, as sent
 }
 
 func (r *resetCountingSink) send(data []byte, _ net.Addr) error {
 	r.mu.Lock()
 	r.sent++
+	r.raw = append(r.raw, append([]byte(nil), data...))
 	r.mu.Unlock()
 	pkt, err := UnmarshalPacket(data)
 	if err != nil {
@@ -347,4 +349,11 @@ func (r *resetCountingSink) datagrams() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sent
+}
+
+// sentRaw returns every datagram sent so far, in order.
+func (r *resetCountingSink) sentRaw() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([][]byte(nil), r.raw...)
 }

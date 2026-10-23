@@ -47,10 +47,15 @@ type Connection struct {
 	incomingStreams chan *Stream
 
 	// Components
-	cc    *CongestionController
-	pm    *PacketManager
-	fc    *FlowController
-	pmtud *PMTUDController
+	cc  *CongestionController
+	pm  *PacketManager
+	fc  *FlowController
+	mtu *MTUDiscovery
+	// ackedLarge (atomic) says whether the last ACK acknowledged any data
+	// packet larger than the base datagram size. Loss revealed by such an
+	// ACK is congestion, not a black hole: a black hole is loss that picks
+	// the full-size packets out while the small ones get through.
+	ackedLarge int32
 
 	// Path migration
 	pathChallenge     [8]byte
@@ -137,7 +142,7 @@ func NewConnection(
 		isInitiator:       isInitiator,
 		maxStreams:        InitialMaxStreams,
 		incomingStreams:   make(chan *Stream, 16),
-		pmtud:             NewPMTUDController(),
+		mtu:               NewMTUDiscovery(clk),
 		pathChallengeResp: make(chan [8]byte, 1),
 		sendFunc:          sendFunc,
 		inbound:           make(chan *Packet, inboundQueue),
@@ -646,11 +651,11 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 		c.handleFrame(pkt, frame)
 	}
 
-	if !isDataBearing(pkt) && !isNumberedPing(pkt) {
+	if !isDataBearing(pkt) && !isNumberedProbe(pkt) {
 		return
 	}
 
-	// Only data-bearing packets and numbered PINGs are acknowledged.
+	// Only data-bearing packets and numbered PINGs and MTU probes are acknowledged.
 	// Acknowledging other control-only packets makes every ACK provoke an ACK
 	// in return, which ping-pongs without end: a 64KB transfer measured
 	// ~176,000 ack-only datagrams for 48 data packets before this guard
@@ -660,18 +665,20 @@ func (c *Connection) HandlePacket(pkt *Packet) {
 	c.noteReceived(pkt)
 }
 
-// isNumberedPing reports whether a packet carries a PING under a nonzero
-// sequence. Peers that track their PINGs (dart-udx and js-udx keepalives and
-// path-MTU probes) number them from their data sequence space and wait for the
-// ACK; left unanswered, their liveness checks fail and MTU discovery never
-// rises above the floor. go-udx's own control packets, PINGs included, go out
-// under sequence 0 and stay unacknowledged, so an ACK still never elicits one.
-func isNumberedPing(pkt *Packet) bool {
+// isNumberedProbe reports whether a packet carries a PING or a path-MTU
+// probe under a nonzero sequence. Peers that track their PINGs (dart-udx
+// and js-udx keepalives) and both sides' MTU probes number them from the
+// data sequence space and wait for the ACK; left unanswered, a liveness
+// check fails and MTU discovery never rises above the base. go-udx's own
+// control packets, PINGs included, go out under sequence 0 and stay
+// unacknowledged, so an ACK still never elicits one.
+func isNumberedProbe(pkt *Packet) bool {
 	if pkt.Sequence == 0 {
 		return false
 	}
 	for _, f := range pkt.Frames {
-		if _, ok := f.(*PingFrame); ok {
+		switch f.(type) {
+		case *PingFrame, *MTUProbeFrame:
 			return true
 		}
 	}
@@ -701,10 +708,13 @@ func (c *Connection) noteReceived(pkt *Packet) {
 			edge = true
 			break
 		}
-		// A PING is waiting on its ACK to measure liveness or a probe size;
-		// delaying it only inflates the answer.
-		if _, ok := f.(*PingFrame); ok {
+		// A PING or MTU probe is waiting on its ACK to measure liveness or
+		// a probe size; delaying it only inflates the answer.
+		switch f.(type) {
+		case *PingFrame, *MTUProbeFrame:
 			edge = true
+		}
+		if edge {
 			break
 		}
 	}
@@ -1044,12 +1054,24 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 		// halved slow start once a receiver acknowledged every second one.
 		bytes := 0
 		var largest *SentPacket
+		var large int32
 		for _, pkt := range acked {
-			bytes += pkt.Size
 			if pkt.Sequence == f.LargestAcked {
 				largest = pkt
 			}
+			if pkt.Probe {
+				// A path-MTU probe: not in flight, but its RTT sample is
+				// as good as any, and it validates its size.
+				c.mtu.OnProbeAcked(pkt.Size)
+				continue
+			}
+			bytes += pkt.Size
+			if pkt.Size > SafeDatagramSize {
+				large = 1
+				c.mtu.OnDataAcked(pkt.Size)
+			}
 		}
+		atomic.StoreInt32(&c.ackedLarge, large)
 		var sentTime time.Time
 		if largest != nil {
 			sentTime = largest.SentTime
@@ -1063,7 +1085,101 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 		c.pm.DetectLostPackets()
 		c.flushLost()
 		c.sendCredit.Broadcast()
+		c.probeMTU()
 	}
+}
+
+// MaxDatagram is the datagram size the path has been found to carry: what
+// streams chunk their data to (MTUDiscovery).
+func (c *Connection) MaxDatagram() int { return c.mtu.Current() }
+
+// probeMTU sends the next path-MTU probe when the search wants one: a
+// packet padded to the size under test, numbered and tracked so that its
+// ACK or loss reports back, but not booked in flight (one at a time, and
+// section 14.4 of RFC 9000 keeps probes out of the congestion signals) and
+// never re-sent. Probing waits for an RTT sample, which loss detection
+// needs, and follows the ACKs: a connection with nothing to acknowledge
+// has nothing to gain from a larger datagram.
+func (c *Connection) probeMTU() {
+	if !c.cc.HasRttSample() {
+		return
+	}
+	size := c.mtu.NextProbe()
+	if size == 0 {
+		return
+	}
+	seq := c.pm.NextSequence()
+	pkt := &Packet{
+		Version:        VersionCurrent,
+		DestinationCID: c.remoteCID,
+		SourceCID:      c.localCID,
+		Sequence:       seq,
+		Frames:         []Frame{&MTUProbeFrame{ProbeSize: 1}},
+	}
+	header := len(MarshalPacket(pkt)) - 1
+	pkt.Frames = []Frame{&MTUProbeFrame{ProbeSize: size - header}}
+	data := MarshalPacket(pkt)
+	c.pm.SendPacket(&SentPacket{Sequence: seq, Size: len(data), Frames: pkt.Frames, Probe: true})
+
+	c.mu.Lock()
+	c.bytesSent += int64(len(data))
+	c.mu.Unlock()
+	if c.sendFunc != nil {
+		c.sendFunc(data, c.peerAddr())
+	}
+}
+
+// fitToPath re-chunks a packet larger than the path now carries (the size
+// fell back after a black hole) into packets that fit, in its place: the
+// original is dropped from tracking and the pieces take fresh sequences
+// when they are re-sent. A packet that fits is returned as it is. Only a
+// packet carrying one STREAM frame is split, which is every data packet a
+// stream sends.
+func (c *Connection) fitToPath(pkt *SentPacket) []*SentPacket {
+	limit := c.mtu.Current()
+	if pkt.Size <= limit || len(pkt.Frames) != 1 {
+		return []*SentPacket{pkt}
+	}
+	sf, ok := pkt.Frames[0].(*StreamFrame)
+	if !ok {
+		return []*SentPacket{pkt}
+	}
+	size := func(frame *StreamFrame) int {
+		return len(MarshalPacket(&Packet{
+			Version:             VersionCurrent,
+			DestinationCID:      c.remoteCID,
+			SourceCID:           c.localCID,
+			DestinationStreamID: pkt.DestinationStreamID,
+			SourceStreamID:      pkt.SourceStreamID,
+			Frames:              []Frame{frame},
+		}))
+	}
+	piece := limit - size(&StreamFrame{IsSyn: sf.IsSyn, Offset: sf.Offset})
+	if piece <= 0 || piece >= len(sf.Data) {
+		return []*SentPacket{pkt}
+	}
+	c.pm.Drop(pkt)
+	var pieces []*SentPacket
+	data, offset, isSyn := sf.Data, sf.Offset, sf.IsSyn
+	for len(data) > 0 {
+		k := piece
+		if k > len(data) {
+			k = len(data)
+		}
+		frame := &StreamFrame{IsSyn: isSyn, IsFin: sf.IsFin && k == len(data), Offset: offset, Data: data[:k]}
+		isSyn = false
+		pieces = append(pieces, &SentPacket{
+			Size:                size(frame),
+			Frames:              []Frame{frame},
+			DestinationStreamID: pkt.DestinationStreamID,
+			SourceStreamID:      pkt.SourceStreamID,
+			FirstSentTime:       pkt.FirstSentTime,
+			RetransmitCount:     pkt.RetransmitCount,
+		})
+		offset += uint64(k)
+		data = data[k:]
+	}
+	return pieces
 }
 
 // onPTO is the probe timeout (RFC 9002 section 6.2.4): nothing has been
@@ -1073,11 +1189,23 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 // pacer are not consulted: a probe is allowed out when nothing else is
 // (section 7.7 exempts probes from pacing). It is still drawn from the
 // pacing budget, so what follows it is paced as if it had been.
+//
+// BlackholePTOs expirations in a row with nothing acknowledged, while
+// streams send more than the base datagram size, is read as the path
+// having stopped carrying that size (a carrier's tunnel after a handover
+// drops every full-size packet and answers nothing): the size falls back
+// to the base, and the probes, like every re-send after, are re-chunked
+// to fit (fitToPath), so they are the first packets that can get through.
 func (c *Connection) onPTO() {
+	if c.cc.PTOCount() >= BlackholePTOs {
+		c.mtu.Blackhole()
+	}
 	for _, pkt := range c.pm.OldestUnacked(ptoProbes) {
-		if seq, ok := c.pm.Resend(pkt); ok {
-			c.retransmitPacket(pkt, seq)
-			c.cc.Pacer.OnPacketSent(pkt.Size)
+		for _, piece := range c.fitToPath(pkt) {
+			if seq, ok := c.pm.Resend(piece); ok {
+				c.retransmitPacket(piece, seq)
+				c.cc.Pacer.OnPacketSent(piece.Size)
+			}
 		}
 	}
 }
@@ -1089,6 +1217,24 @@ func (c *Connection) onPTO() {
 // collapses to the minimum (RFC 9002 section 7.6). The packets then queue
 // for re-sending as the window allows.
 func (c *Connection) onPacketsLost(lost []*SentPacket) {
+	// A lost path-MTU probe says its size does not cross the path, and no
+	// more: it was never in flight and is not re-sent. Lost data larger
+	// than the base counts towards a black hole, unless the ACK that
+	// revealed the loss acknowledged full-size data too: then the path
+	// carries the size and the loss is congestion.
+	data := lost[:0:0]
+	countLarge := atomic.LoadInt32(&c.ackedLarge) == 0
+	for _, pkt := range lost {
+		if pkt.Probe {
+			c.mtu.OnProbeLost(pkt.Size)
+			continue
+		}
+		if countLarge {
+			c.mtu.OnDataLost(pkt.Size)
+		}
+		data = append(data, pkt)
+	}
+	lost = data
 	if len(lost) == 0 {
 		return
 	}
@@ -1134,6 +1280,14 @@ func (c *Connection) flushLost() {
 		if pkt.IsAcked {
 			c.lostQueue = c.lostQueue[1:]
 			continue
+		}
+		if pkt.Size > c.mtu.Current() {
+			// The path shrank under it: its pieces take its place in
+			// the queue, each through the gates below.
+			if pieces := c.fitToPath(pkt); len(pieces) > 1 {
+				c.lostQueue = append(pieces, c.lostQueue[1:]...)
+				continue
+			}
 		}
 		if wait := c.cc.Pacer.TimeUntilSend(); wait > 0 {
 			c.lostTimer = c.clk.AfterFunc(wait, c.flushLost)

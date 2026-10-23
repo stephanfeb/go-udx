@@ -85,7 +85,8 @@ func (m *mockStreamConn) sendStreamFrames(streamID, remoteID uint32, offset uint
 	}
 }
 
-func (m *mockStreamConn) clock() Clock { return m.clk }
+func (m *mockStreamConn) clock() Clock     { return m.clk }
+func (m *mockStreamConn) MaxDatagram() int { return SafeDatagramSize }
 
 func newTestStream(t *testing.T) (*Stream, *mockStreamConn) {
 	t.Helper()

@@ -157,11 +157,24 @@ const (
 	LossDetectionThresholdDen = 8.0
 )
 
-// Path MTU Discovery
+// Path MTU discovery (RFC 8899), in datagram bytes: the search probes up
+// from SafeDatagramSize towards MaxDatagramSize (MTUDiscovery).
 const (
-	MinMTU          = 1280
-	MaxMTU          = 1500
-	MTUProbeTimeout = 2 * time.Second
+	// MTUProbeTries is how many times a probe size is lost before it is
+	// ruled out: one loss is as likely congestion as a path that cannot
+	// carry it.
+	MTUProbeTries = 3
+	// MTUSearchStep ends the search once the validated size is this close
+	// to one that failed.
+	MTUSearchStep = 16
+	// BlackholePackets is how many full-size data packets must be lost in a
+	// row, with none acknowledged in between, before the path is taken to
+	// have shrunk; BlackholePTOs is the same conclusion from probe timeouts
+	// when nothing at all is acknowledged any more.
+	BlackholePackets = 3
+	BlackholePTOs    = 3
+	// BlackholeRetry is how long after a black hole the search starts over.
+	BlackholeRetry = time.Minute
 )
 
 // Anti-Amplification

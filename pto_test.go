@@ -102,7 +102,11 @@ func TestLoss_ResendsGoThroughTheWindow(t *testing.T) {
 	// the congestion window alone gates the resends.
 	c.cc.OnPacketAcked(0, clk.Now(), 0, true, -1)
 
-	// Fill the initial window: 10 packets of 1200 bytes.
+	// Fill the initial window: 10 packets of 1200 bytes. They exceed the
+	// base datagram size; the path is taken to carry full frames, so that
+	// re-sends are not re-chunked (fitToPath).
+	c.mtu.NextProbe()
+	c.mtu.OnProbeAcked(MaxDatagramSize)
 	for i := 0; i < 10; i++ {
 		c.sendStreamFrame(4, 2, uint64(i*1200), make([]byte, 1200), false, false)
 	}
@@ -146,6 +150,8 @@ func TestLoss_PersistentCongestionCollapsesTheWindow(t *testing.T) {
 	clk := NewMockClock(time.Now())
 	c, _, _ := connWithStreamClock(t, clk)
 	c.cc.OnPacketAcked(1200, clk.Now().Add(-50*time.Millisecond), 0, true, 0) // an RTT sample
+	c.mtu.NextProbe()
+	c.mtu.OnProbeAcked(MaxDatagramSize) // the packets below exceed the base datagram
 
 	// Packets sent across four PTOs, none acknowledged.
 	for i := 0; i < 4; i++ {
@@ -244,14 +250,17 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 
 	// Expirations in the gap are at 1, 3, 7, 15, ... PTOs, each sending
 	// ptoProbes datagrams: on loopback the PTO is about max_ack_delay, 25 ms,
-	// so seven in three seconds.
+	// so seven in three seconds. After BlackholePTOs of them the datagram
+	// size falls back to the base and a full-size probe goes out re-chunked
+	// in two.
 	expirations := 0
 	for at := base; at < gap; at = at*2 + base {
 		expirations++
 	}
-	if limit := int64(ptoProbes*expirations + 2); during > limit {
-		t.Fatalf("%d datagrams were sent into a %v gap; want at most %d (%d PTOs x %d probes)",
-			during, gap, limit, expirations, ptoProbes)
+	pieces := (MaxDatagramSize + SafeDatagramSize - 1) / SafeDatagramSize
+	if limit := int64(ptoProbes*pieces*expirations + 2); during > limit {
+		t.Fatalf("%d datagrams were sent into a %v gap; want at most %d (%d PTOs x %d probes x %d pieces)",
+			during, gap, limit, expirations, ptoProbes, pieces)
 	}
 	if during < ptoProbes {
 		t.Fatalf("%d datagrams were sent into a %v gap; want at least one PTO's %d probes", during, gap, ptoProbes)

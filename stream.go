@@ -88,6 +88,7 @@ type streamConn interface {
 	awaitSendCredit(size int, deadline time.Time) bool
 	awaitSendCreditUpTo(minSize, maxSize int, deadline time.Time) (int, bool)
 	clock() Clock
+	MaxDatagram() int
 }
 
 // NewStream creates a new stream.
@@ -184,6 +185,23 @@ func (s *Stream) blockedWakeupLocked() time.Time {
 	return retry
 }
 
+// chunkSizeLocked is how much stream data one packet carries: the datagram
+// size the path has been found to carry (Connection.MaxDatagram), less a
+// conservative allowance for the packet and frame headers. Caller holds
+// s.mu.
+func (s *Stream) chunkSizeLocked() int {
+	size := SafeDatagramSize
+	if s.conn != nil {
+		size = s.conn.MaxDatagram()
+	}
+	return size - streamChunkOverhead
+}
+
+// streamChunkOverhead is what a stream data packet's bytes come to besides
+// the data: the packet header with both connection IDs at their longest, and
+// the STREAM frame header, with room to spare.
+const streamChunkOverhead = 100
+
 // Write writes data to the stream. Fragments by MTU and applies back-pressure.
 func (s *Stream) Write(p []byte) (int, error) {
 	s.mu.Lock()
@@ -240,7 +258,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 		// actually granted. Without the clamp a chunk can overshoot the
 		// advertised offset by up to a full chunk, which the peer is entitled
 		// to treat as a flow-control violation.
-		chunkSize := SafeDatagramSize - 100 // conservative header overhead
+		chunkSize := s.chunkSizeLocked()
 		want := len(data)
 		if want > sendBatchMax*chunkSize {
 			want = sendBatchMax * chunkSize

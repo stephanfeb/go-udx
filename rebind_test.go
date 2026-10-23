@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,8 +21,8 @@ type natProxy struct {
 
 	// maxSize, when set, drops every datagram larger than it, as a link
 	// with a small MTU does (a carrier's tunnel, 464XLAT) when the packet
-	// may not be fragmented.
-	maxSize int
+	// may not be fragmented. limit changes it while the proxy runs.
+	maxSize int64
 
 	// delay, when set, holds every datagram for that long in each
 	// direction: the path's one-way latency. Each direction's datagrams are
@@ -45,7 +46,7 @@ func newNATProxy(t *testing.T, server net.Addr, maxSize int, delay time.Duration
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &natProxy{t: t, inside: inside, server: server.(*net.UDPAddr), maxSize: maxSize, delay: delay,
+	p := &natProxy{t: t, inside: inside, server: server.(*net.UDPAddr), maxSize: int64(maxSize), delay: delay,
 		toServer: make(chan heldDatagram, 4096), toClient: make(chan heldDatagram, 4096), stop: make(chan struct{})}
 	p.rebind()
 	go p.fromClient()
@@ -62,6 +63,15 @@ func newNATProxy(t *testing.T, server net.Addr, maxSize int, delay time.Duration
 }
 
 func (p *natProxy) addr() net.Addr { return p.inside.LocalAddr() }
+
+// limit sets the largest datagram the path passes from now on, 0 for any.
+func (p *natProxy) limit(maxSize int) { atomic.StoreInt64(&p.maxSize, int64(maxSize)) }
+
+// passes reports whether a datagram of n bytes crosses the path.
+func (p *natProxy) passes(n int) bool {
+	max := atomic.LoadInt64(&p.maxSize)
+	return max == 0 || int64(n) <= max
+}
 
 // rebind gives the client a new outbound port; the old one is gone.
 func (p *natProxy) rebind() {
@@ -86,7 +96,7 @@ func (p *natProxy) fromClient() {
 		if err != nil {
 			return
 		}
-		if p.maxSize > 0 && n > p.maxSize {
+		if !p.passes(n) {
 			continue
 		}
 		p.mu.Lock()
@@ -141,7 +151,7 @@ func (p *natProxy) fromServer(out *net.UDPConn) {
 		if err != nil {
 			return
 		}
-		if p.maxSize > 0 && n > p.maxSize {
+		if !p.passes(n) {
 			continue
 		}
 		p.mu.Lock()

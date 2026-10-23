@@ -180,7 +180,7 @@ func (m *Multiplexer) idleTimeoutLoop() {
 func (m *Multiplexer) readLoop() {
 	ms := make([]ipv4.Message, readBatchSize)
 	for i := range ms {
-		ms[i].Buffers = [][]byte{make([]byte, MaxMTU+100)}
+		ms[i].Buffers = [][]byte{make([]byte, MaxDatagramSize+128)}
 	}
 	for {
 		select {
