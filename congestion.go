@@ -33,24 +33,22 @@ type CongestionController struct {
 	// In-flight tracking
 	inflight int
 
-	// Duplicate ACK tracking
-	dupAcks              int
-	lastAckedForDupCount int
-	highestCumulativeAck int
-
 	// Recovery state
-	inRecovery           bool
-	recoveryEndSeq       int
-	lostPacketInRecovery int
+	inRecovery     bool
+	recoveryEndSeq int
 
-	// PTO
-	ptoTimer      *time.Timer
-	ptoRetryCount int
-	MaxPtoRetries int
+	// PTO (RFC 9002 section 6.2): one timer per connection, armed from the
+	// last ack-eliciting send, backing off by ptoCount until an ACK arrives.
+	// There is no retry cap: a path that never answers is ended by the
+	// connection's idle timeout, not by the probing stopping.
+	ptoTimer     *time.Timer
+	ptoCount     int
+	lastSendTime time.Time
 
-	// Callbacks
-	OnProbe          func()
-	OnFastRetransmit func(seq int)
+	// OnProbe is called when the PTO fires: the connection sends a probe or
+	// two (the oldest outstanding data under fresh sequences), without
+	// touching the window.
+	OnProbe func()
 
 	// Pacer
 	Pacer *PacingController
@@ -62,20 +60,16 @@ type CongestionController struct {
 // NewCongestionController creates a new congestion controller.
 func NewCongestionController(clock Clock, lastSentSeqFn func() int) *CongestionController {
 	cc := &CongestionController{
-		clock:                clock,
-		cwnd:                 InitialCwnd,
-		ssthresh:             65535,
-		smoothedRtt:          100 * time.Millisecond,
-		rttVar:               50 * time.Millisecond,
-		minRtt:               time.Second,
-		firstRttSample:       true,
-		lastAckedForDupCount: -1,
-		highestCumulativeAck: -1,
-		recoveryEndSeq:       -1,
-		lostPacketInRecovery: -1,
-		MaxPtoRetries:        10,
-		Pacer:                NewPacingController(clock),
-		lastSentSeqFn:        lastSentSeqFn,
+		clock:          clock,
+		cwnd:           InitialCwnd,
+		ssthresh:       65535,
+		smoothedRtt:    100 * time.Millisecond,
+		rttVar:         50 * time.Millisecond,
+		minRtt:         time.Second,
+		firstRttSample: true,
+		recoveryEndSeq: -1,
+		Pacer:          NewPacingController(clock),
+		lastSentSeqFn:  lastSentSeqFn,
 	}
 	return cc
 }
@@ -139,8 +133,10 @@ func (cc *CongestionController) InRecovery() bool {
 	return cc.inRecovery
 }
 
-// PTO returns the current Probe Timeout duration.
-// PTO = smoothed_rtt + max(4 * rttvar, 1ms) + max_ack_delay
+// PTO returns the base Probe Timeout (RFC 9002 section 6.2.1):
+// smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay, within
+// [MinPTO, MaxPTO]. The peer delays its ACKs by up to MaxAckDelay, so a PTO
+// without that term fires on a delayed ACK alone.
 func (cc *CongestionController) PTO() time.Duration {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -148,14 +144,37 @@ func (cc *CongestionController) PTO() time.Duration {
 }
 
 func (cc *CongestionController) pto() time.Duration {
-	ptoMs := cc.smoothedRtt.Milliseconds() + 4*cc.rttVar.Milliseconds()
-	if ptoMs < 200 {
-		ptoMs = 200
+	v := 4 * cc.rttVar
+	if v < LossTimerGranularity {
+		v = LossTimerGranularity
 	}
-	if ptoMs > 5000 {
-		ptoMs = 5000
+	pto := cc.smoothedRtt + v + MaxAckDelay
+	if pto < MinPTO {
+		pto = MinPTO
 	}
-	return time.Duration(ptoMs) * time.Millisecond
+	if pto > MaxPTO {
+		pto = MaxPTO
+	}
+	return pto
+}
+
+// PTOCount is how many PTOs have fired since the last ACK; the next PTO
+// waits pto << PTOCount.
+func (cc *CongestionController) PTOCount() int {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.ptoCount
+}
+
+// nextPTO is the wait for the next probe: the base PTO backed off by the
+// number of PTOs that have fired without an ACK. Uncapped: the idle timeout
+// ends the connection before this grows absurd.
+func (cc *CongestionController) nextPTO() time.Duration {
+	shift := cc.ptoCount
+	if shift > 20 {
+		shift = 20
+	}
+	return cc.pto() << uint(shift)
 }
 
 // CanSend returns true if we can send the given number of bytes.
@@ -180,6 +199,7 @@ func (cc *CongestionController) OnPacketSent(bytes int) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.inflight += bytes
+	cc.lastSendTime = cc.clock.Now()
 	cc.armPtoTimer()
 }
 
@@ -195,9 +215,6 @@ func (cc *CongestionController) OnPacketAcked(bytes int, sentTime time.Time, ack
 
 	if isNewCumulativeAck {
 		cc.updateRtt(sentTime, ackDelay)
-		cc.highestCumulativeAck = largestAcked
-		cc.dupAcks = 0
-		cc.lastAckedForDupCount = -1
 
 		if cc.inRecovery {
 			if largestAcked > cc.recoveryEndSeq {
@@ -216,12 +233,13 @@ func (cc *CongestionController) OnPacketAcked(bytes int, sentTime time.Time, ack
 		}
 	}
 
-	// Reset PTO on ACK
+	// An ACK is proof the path answers: the PTO backoff starts over
+	// (RFC 9002 section 6.2.1), measured from the last send.
 	if cc.ptoTimer != nil {
 		cc.ptoTimer.Stop()
 		cc.ptoTimer = nil
 	}
-	cc.ptoRetryCount = 0
+	cc.ptoCount = 0
 
 	if cc.inflight > 0 {
 		cc.armPtoTimer()
@@ -290,11 +308,10 @@ func (cc *CongestionController) cubicUpdate(bytes int) {
 	}
 }
 
-// OnPacketLost is called when a packet is abandoned outright: its bytes leave
-// flight and the window contracts. Retransmitted loss does NOT come through
-// here — the bytes stay in flight until acknowledged, so a resent packet must
-// not be double-counted out of inflight. That path calls OnCongestionEvent,
-// which contracts the window without touching inflight.
+// OnPacketLost is called when a packet is declared lost: its bytes leave
+// flight (RFC 9002 section 7.3) and the window contracts, once per recovery
+// epoch. When the data is re-sent it is booked again by OnPacketSent, as the
+// new packet it is.
 func (cc *CongestionController) OnPacketLost(bytes int) {
 	cc.mu.Lock()
 	cc.inflight -= bytes
@@ -304,6 +321,37 @@ func (cc *CongestionController) OnPacketLost(bytes int) {
 	cc.mu.Unlock()
 
 	cc.OnCongestionEvent()
+}
+
+// OnPersistentCongestion is the RFC 9002 section 7.6 reaction: the window
+// collapses to the minimum and recovery ends, so sending restarts in slow
+// start, as after an outage long enough that everything sent in three PTOs
+// was lost. Called after OnPacketLost for the same loss event.
+func (cc *CongestionController) OnPersistentCongestion() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.cwnd = MinCwnd
+	cc.inRecovery = false
+	cc.recoveryEndSeq = -1
+	cc.epochStart = time.Time{}
+	cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
+}
+
+// PersistentCongestionDuration is how long a span of loss must cover before
+// it counts as persistent congestion (RFC 9002 section 7.6.1): three PTOs,
+// with the max_ack_delay term, as the PTO here already includes it.
+func (cc *CongestionController) PersistentCongestionDuration() time.Duration {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.pto() * PersistentCongestionThreshold
+}
+
+// HasRttSample reports whether any RTT sample has been taken; persistent
+// congestion is only declared once one has (section 7.6.2).
+func (cc *CongestionController) HasRttSample() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return !cc.firstRttSample
 }
 
 // OnCongestionEvent contracts the congestion window in response to detected
@@ -342,42 +390,7 @@ func (cc *CongestionController) OnCongestionEvent() {
 	cc.k = math.Cbrt(diff)
 
 	cc.cwnd = cc.ssthresh
-	cc.dupAcks = 0
 	cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
-}
-
-// ProcessDuplicateAck handles duplicate ACK processing for fast retransmit.
-func (cc *CongestionController) ProcessDuplicateAck(frameLargestAcked int) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	if frameLargestAcked == cc.lastAckedForDupCount {
-		cc.dupAcks++
-	} else {
-		cc.dupAcks = 1
-		cc.lastAckedForDupCount = frameLargestAcked
-	}
-
-	if cc.dupAcks >= 3 {
-		if !cc.inRecovery {
-			cc.inRecovery = true
-			cc.lostPacketInRecovery = cc.lastAckedForDupCount + 1
-			if cc.lastSentSeqFn != nil {
-				cc.recoveryEndSeq = cc.lastSentSeqFn()
-			}
-
-			cc.ssthresh = cc.cwnd / 2
-			if cc.ssthresh < MinCwnd {
-				cc.ssthresh = MinCwnd
-			}
-			cc.cwnd = cc.ssthresh
-			cc.Pacer.UpdateRate(cc.cwnd, cc.minRtt)
-
-			if cc.OnFastRetransmit != nil {
-				cc.OnFastRetransmit(cc.lostPacketInRecovery)
-			}
-		}
-	}
 }
 
 // SetSmoothedRtt sets the smoothed RTT (for testing).
@@ -394,35 +407,49 @@ func (cc *CongestionController) SetRttVar(d time.Duration) {
 	cc.rttVar = d
 }
 
+// armPtoTimer sets the PTO timer to fire nextPTO after the last
+// ack-eliciting send (RFC 9002 section 6.2.1). Caller holds cc.mu.
 func (cc *CongestionController) armPtoTimer() {
 	if cc.ptoTimer != nil {
 		cc.ptoTimer.Stop()
 	}
-	cc.ptoTimer = cc.clock.AfterFunc(cc.pto(), cc.onPtoTimeout)
+	wait := cc.nextPTO()
+	if !cc.lastSendTime.IsZero() {
+		if remaining := cc.lastSendTime.Add(wait).Sub(cc.clock.Now()); remaining < wait {
+			wait = remaining
+		}
+	}
+	if wait < LossTimerGranularity {
+		wait = LossTimerGranularity
+	}
+	cc.ptoTimer = cc.clock.AfterFunc(wait, cc.onPtoTimeout)
 }
 
+// onPtoTimeout fires when nothing has been acknowledged for a PTO: the
+// connection sends a probe (OnProbe), and the next PTO waits twice as long.
+// The window is untouched; loss is declared only once an ACK proves it.
 func (cc *CongestionController) onPtoTimeout() {
 	cc.mu.Lock()
-	cc.ptoRetryCount++
-	count := cc.ptoRetryCount
+	cc.ptoCount++
+	cc.ptoTimer = nil
 	cc.mu.Unlock()
 
-	if count <= cc.MaxPtoRetries {
-		if cc.OnProbe != nil {
-			cc.OnProbe()
-		}
-		cc.mu.Lock()
-		nextPto := cc.pto() * 2
-		cc.ptoTimer = cc.clock.AfterFunc(nextPto, cc.onPtoTimeout)
-		cc.mu.Unlock()
-	} else {
-		cc.mu.Lock()
-		cc.ptoRetryCount = 0
-		backoff := cc.pto() * 4
-		cc.ptoTimer = cc.clock.AfterFunc(backoff, cc.onPtoTimeout)
-		cc.mu.Unlock()
+	if cc.OnProbe != nil {
+		cc.OnProbe()
 	}
+
+	cc.mu.Lock()
+	if cc.inflight > 0 && cc.ptoTimer == nil {
+		// Measured from now: the probe just sent is the last send.
+		cc.lastSendTime = cc.clock.Now()
+		cc.ptoTimer = cc.clock.AfterFunc(cc.nextPTO(), cc.onPtoTimeout)
+	}
+	cc.mu.Unlock()
 }
+
+// FirePTO runs the PTO expiry by hand, for tests on a clock whose timers do
+// not fire.
+func (cc *CongestionController) FirePTO() { cc.onPtoTimeout() }
 
 // Destroy cancels all timers.
 func (cc *CongestionController) Destroy() {

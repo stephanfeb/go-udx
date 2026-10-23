@@ -97,6 +97,14 @@ type Connection struct {
 	sendCreditMu sync.Mutex
 	sendCredit   *sync.Cond
 
+	// Packets declared lost, waiting to be re-sent as the congestion window
+	// and the pacer allow (flushLost), oldest first; lostTimer is the pacer's
+	// wait. Lost data goes before new data: handleAckFrame drains this queue
+	// before waking writers.
+	lostMu    sync.Mutex
+	lostQueue []*SentPacket
+	lostTimer *time.Timer
+
 	// Idle timeout (RFC 9000 section 10.1). lastActivity is stamped on every
 	// received packet; a self-rearming watchdog closes the connection once it
 	// has been silent longer than idleTimeout(). This is the backstop that ends
@@ -147,12 +155,15 @@ func NewConnection(
 		return -1
 	})
 	c.pm = NewPacketManager(clk, c.cc)
-	// Retransmission re-keys the packet under a fresh sequence inside the packet
-	// manager and then calls this to put it on the wire; the callback only
-	// marshals and sends. There is no permanent-loss callback any more: a packet
-	// is re-sent until acknowledged, and a path that has gone silent is ended by
-	// the idle timeout closing the whole connection, not by resetting one stream.
+	// A re-send takes a fresh sequence inside the packet manager (Resend) and
+	// this puts it on the wire; it only marshals and sends. Loss detection
+	// hands what it declared lost to onPacketsLost, and the PTO to onPTO.
+	// There is no permanent-loss callback: data is re-sent until acknowledged,
+	// and a path that has gone silent is ended by the idle timeout closing the
+	// whole connection, not by resetting one stream.
 	c.pm.OnRetransmit = c.retransmitPacket
+	c.pm.OnPacketsLost = c.onPacketsLost
+	c.cc.OnProbe = c.onPTO
 	c.fc = NewFlowController(int64(InitialMaxData), int64(InitialMaxData))
 
 	// Odd stream IDs for initiator, even for responder
@@ -262,6 +273,14 @@ func (c *Connection) closeInternal(code uint32, reason string, announce bool) er
 		c.sendCredit.Broadcast()
 		c.sendCreditMu.Unlock()
 
+		c.lostMu.Lock()
+		if c.lostTimer != nil {
+			c.lostTimer.Stop()
+			c.lostTimer = nil
+		}
+		c.lostQueue = nil
+		c.lostMu.Unlock()
+
 		c.cc.Destroy()
 		c.pm.Destroy()
 
@@ -306,11 +325,11 @@ func (c *Connection) onIdleCheck() {
 // idleTimeout is the silence a connection tolerates before it is closed. RFC
 // 9000 section 10.1 requires at least three PTOs, so loss recovery always gets
 // a chance before the path is declared dead. That floor is dynamic: on a slow
-// link the retransmission schedule stretches with the RTO and can exceed a
-// fixed 30s, so the timeout has to stretch with it rather than cut recovery off.
+// link the probe schedule stretches with the PTO and can exceed a fixed 30s,
+// so the timeout has to stretch with it rather than cut recovery off.
 func (c *Connection) idleTimeout() time.Duration {
 	d := MaxIdleTimeout
-	if pto := 3 * c.pm.retransmitTimeout(); pto > d {
+	if pto := 3 * c.cc.PTO(); pto > d {
 		d = pto
 	}
 	return d
@@ -553,20 +572,20 @@ func (c *Connection) sendFrames(frames []Frame) {
 	c.sendPacket(0, 0, frames)
 }
 
-// retransmitPacket puts a packet back on the wire. PacketManager.Retransmit has
+// retransmitPacket puts a packet back on the wire. PacketManager.Resend has
 // already advanced pkt.Sequence to a fresh number and re-keyed its tracking, so
 // this only marshals and sends — under the new sequence, QUIC-style, never the
 // original (RFC 9000 section 12.3).
 //
-// No OnPacketSent: the bytes were charged to the congestion window at their
-// first transmission and remain in flight until acknowledged. A retransmission
-// carries the same bytes, so counting it again would double-charge one packet.
+// No OnPacketSent here: a PTO probe's bytes are still in flight from the first
+// transmission (onPTO), and a lost packet's are booked by flushLost as it goes
+// out, so the congestion accounting is the caller's either way.
 func (c *Connection) retransmitPacket(pkt *SentPacket, seq uint32) {
-	// seq is passed rather than read from pkt.Sequence: Retransmit assigns it
+	// seq is passed rather than read from pkt.Sequence: Resend assigns it
 	// under the packet manager's lock and this send runs unlocked, so reading
-	// the field here would race a concurrent re-key of the same packet (an RTO
-	// timer firing while the ACK path also retransmits it). The frames and
-	// stream IDs are fixed once the packet is first sent, so those are safe.
+	// the field here would race a concurrent re-key of the same packet (a PTO
+	// firing while the ACK path also re-sends it). The frames and stream IDs
+	// are fixed once the packet is first sent, so those are safe.
 	rePkt := &Packet{
 		Version:             VersionCurrent,
 		DestinationCID:      c.remoteCID,
@@ -1037,26 +1056,105 @@ func (c *Connection) handleAckFrame(f *AckFrame) {
 		}
 		c.cc.OnPacketAcked(bytes, sentTime, time.Duration(f.AckDelay)*time.Millisecond,
 			largest != nil, int(f.LargestAcked))
+		// Then loss detection over every outstanding packet below the
+		// largest acknowledged (RFC 9002 section 6.1); what it declares lost
+		// goes to onPacketsLost. Lost data first, then new data: the window
+		// the ACK opened goes to the resend queue before writers are woken.
+		c.pm.DetectLostPackets()
+		c.flushLost()
 		c.sendCredit.Broadcast()
 	}
+}
 
-	// SACK-based loss detection: retransmit packets that fall within gaps.
-	//
-	// A detected loss both contracts the window (OnCongestionEvent, idempotent
-	// within the recovery epoch) and re-sends the packet under a fresh sequence.
-	// Retransmit collapses a resend that a firing RTO timer has already covered,
-	// so a packet is not sent twice for one loss. The bytes never leave inflight
-	// across this — they are being recovered, not abandoned — so there is no
-	// OnPacketLost/OnPacketSent pair to balance here.
-	lost := c.pm.DetectLostPackets(f)
-	for _, seq := range lost {
-		if pkt := c.pm.GetPacket(seq); pkt != nil {
-			c.cc.OnCongestionEvent()
-			if newSeq, ok := c.pm.Retransmit(pkt); ok {
-				c.retransmitPacket(pkt, newSeq)
-			}
+// onPTO is the probe timeout (RFC 9002 section 6.2.4): nothing has been
+// acknowledged for a PTO, so the oldest outstanding packets go out again
+// under fresh sequences, up to ptoProbes of them. They are not declared
+// lost (an ACK will say), their bytes stay in flight, and the window and
+// pacer are not consulted: a probe is allowed out when nothing else is.
+func (c *Connection) onPTO() {
+	for _, pkt := range c.pm.OldestUnacked(ptoProbes) {
+		if seq, ok := c.pm.Resend(pkt); ok {
+			c.retransmitPacket(pkt, seq)
 		}
 	}
+}
+
+// onPacketsLost is told by loss detection what is lost, oldest first. The
+// bytes leave flight and the window contracts once per recovery epoch
+// (OnPacketLost); if the loss spans more than three PTOs with no ACK since
+// the oldest went out, that is persistent congestion and the window
+// collapses to the minimum (RFC 9002 section 7.6). The packets then queue
+// for re-sending as the window allows.
+func (c *Connection) onPacketsLost(lost []*SentPacket) {
+	if len(lost) == 0 {
+		return
+	}
+	bytes := 0
+	for _, pkt := range lost {
+		bytes += pkt.Size
+	}
+	c.cc.OnPacketLost(bytes)
+
+	oldest, newest := lost[0], lost[len(lost)-1]
+	if c.cc.HasRttSample() &&
+		newest.SentTime.Sub(oldest.SentTime) >= c.cc.PersistentCongestionDuration() &&
+		c.pm.AckBeforeLoss().Before(oldest.SentTime) {
+		c.cc.OnPersistentCongestion()
+	}
+
+	c.lostMu.Lock()
+	c.lostQueue = append(c.lostQueue, lost...)
+	c.lostMu.Unlock()
+	c.flushLost()
+}
+
+// flushLost re-sends queued lost packets, oldest first, while the
+// congestion window admits them and the pacer allows; each goes out under
+// a fresh sequence and is booked as the new packet it is. When the pacer
+// says wait, a timer resumes the flush; when the window is full, the next
+// ACK does (handleAckFrame).
+func (c *Connection) flushLost() {
+	c.lostMu.Lock()
+	defer c.lostMu.Unlock()
+	if c.lostTimer != nil {
+		c.lostTimer.Stop()
+		c.lostTimer = nil
+	}
+	for len(c.lostQueue) > 0 {
+		select {
+		case <-c.closeCh:
+			c.lostQueue = nil
+			return
+		default:
+		}
+		pkt := c.lostQueue[0]
+		if pkt.IsAcked {
+			c.lostQueue = c.lostQueue[1:]
+			continue
+		}
+		if wait := c.cc.Pacer.TimeUntilSend(); wait > 0 {
+			c.lostTimer = c.clk.AfterFunc(wait, c.flushLost)
+			return
+		}
+		if !c.cc.CanSend(pkt.Size) {
+			return
+		}
+		c.lostQueue = c.lostQueue[1:]
+		seq, ok := c.pm.Resend(pkt)
+		if !ok {
+			continue
+		}
+		c.cc.OnPacketSent(pkt.Size)
+		c.cc.Pacer.OnPacketSent(pkt.Size)
+		c.retransmitPacket(pkt, seq)
+	}
+}
+
+// LostQueueLen is how many lost packets wait for window to be re-sent.
+func (c *Connection) LostQueueLen() int {
+	c.lostMu.Lock()
+	defer c.lostMu.Unlock()
+	return len(c.lostQueue)
 }
 
 func (c *Connection) handleWindowUpdate(pkt *Packet, f *WindowUpdateFrame) {

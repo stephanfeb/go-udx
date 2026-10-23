@@ -12,7 +12,7 @@ package udx
 //
 // Sequences more than ackHistory below the largest are forgotten. An ACK can
 // carry at most five ranges, so a receiver that far behind is already being
-// described by the sender's RTO rather than by SACK; and because the history
+// described by the sender's PTO and time threshold rather than by SACK; and because the history
 // is a window below the largest, a packet that arrives absurdly late is simply
 // not acknowledged, which the sender resolves by retransmitting under a fresh
 // sequence (see PacketManager.Retransmit).

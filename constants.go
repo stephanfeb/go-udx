@@ -187,23 +187,24 @@ const (
 
 // Retransmission
 //
-// There is no per-packet retry cap. A lost packet is re-sent under a fresh
-// sequence number (Connection.retransmitPacket via PacketManager.Retransmit)
-// for as long as the connection lives; what ends a path that has genuinely gone
-// away is MaxIdleTimeout closing the whole connection, not a count running out
-// on one packet. This is QUIC's model (RFC 9002 has no retry limit; delivery is
-// bounded by the idle timeout), and it is why loss can no longer strand a
-// stream with an unfillable hole and reset it.
+// There is no retransmission timer per packet and no per-packet retry cap.
+// Loss is declared from acknowledgements (PacketManager.detectLostLocked:
+// the packet and time thresholds of RFC 9002 section 6.1), and the lost data
+// is re-sent under a fresh sequence number through the congestion window.
+// When nothing is acknowledged at all, the connection's one PTO timer
+// (CongestionController) sends ptoProbes probes, backing off exponentially
+// for as long as the connection lives; what ends a path that has genuinely
+// gone away is MaxIdleTimeout closing the whole connection.
 //
-// The backoff below only shapes how fast successive attempts are spaced.
+// This replaced one RTO timer per packet. On a radio gap every timer fired
+// together and the whole window went out again, past the congestion window
+// and the pacer, and again every two seconds into a dead path; the resends
+// never contracted the window, so after the gap the sender resumed at the
+// pre-gap window into a path whose capacity it no longer knew.
 const (
-	MinRetransmitTimeout = 200 * time.Millisecond
-
-	// MaxRetransmitBackoff caps the wait between attempts. It is a ceiling, not
-	// a fixed interval, and never applies below the current RTO — retransmitting
-	// faster than the round trip just piles duplicates onto a path that has not
-	// had time to answer.
-	MaxRetransmitBackoff = 2 * time.Second
+	// ptoProbes is how many outstanding packets a PTO re-sends, the oldest
+	// first (RFC 9002 section 6.2.4 allows up to two).
+	ptoProbes = 2
 )
 
 // Loss detection thresholds, RFC 9002 section 6.1.

@@ -1,14 +1,23 @@
 package udx
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
 
 // SentPacket tracks a packet that was sent and awaits acknowledgment.
 type SentPacket struct {
-	Sequence            uint32
+	// Sequence is the number the packet was LAST sent under. A re-send takes a
+	// fresh one (Resend), so an entry moves from number to number over the
+	// packet's life.
+	Sequence uint32
+	// SentTime is when the packet last went on the wire; FirstSentTime when it
+	// first did. The RTT sample and loss detection measure from the last send
+	// (a fresh sequence makes its ACK unambiguous); persistent congestion
+	// measures how long the data has gone undelivered, from the first.
 	SentTime            time.Time
+	FirstSentTime       time.Time
 	Size                int
 	IsAcked             bool
 	Frames              []Frame
@@ -18,7 +27,26 @@ type SentPacket struct {
 	LastRetransmit      time.Time
 }
 
-// PacketManager tracks sent packets, handles ACK processing, and schedules retransmissions.
+// PacketManager tracks sent packets, matches ACKs to them, and declares loss
+// the way RFC 9002 section 6.1 does: from acknowledgements, never from a
+// per-packet timer.
+//
+// A packet is lost once a later one has been acknowledged and it is either
+// LossReorderThreshold sequences behind the largest acknowledged or older than
+// lossDelay (9/8 of the RTT). Packets behind but not yet old enough wait on the
+// loss timer, which declares them lost when the delay elapses without another
+// ACK. What is lost is handed to OnPacketsLost; the connection contracts its
+// window once per recovery epoch and re-sends the data under fresh sequences
+// through the congestion window and the pacer.
+//
+// This replaced one retransmission timer per packet, armed at the RTO and
+// backing off to a 2 s cap. On a radio gap every timer fired together and the
+// whole window went out again at once, past the congestion window, and again
+// every 2 s into a dead path. The timer-driven resends did not contract the
+// window either, so after the gap the sender resumed at the pre-gap window.
+// QUIC's one PTO per connection (CongestionController) sends a probe or two
+// instead, backing off until the idle timeout, and loss is declared only once
+// an ACK proves it.
 type PacketManager struct {
 	clock Clock
 	mu    sync.Mutex
@@ -27,34 +55,46 @@ type PacketManager struct {
 	nextSeq     uint32
 	lastSentSeq int // -1 if nothing sent
 
-	// Sent packets awaiting ACK, keyed by their CURRENT sequence number. A
-	// retransmission re-keys its packet under a fresh sequence (see Retransmit),
-	// so an entry moves from one number to the next over the packet's life.
+	// Sent packets awaiting ACK, keyed by their CURRENT sequence number.
 	sentPackets map[uint32]*SentPacket
 
-	// Retransmission timers, keyed the same way as sentPackets and re-keyed
-	// alongside them: one live timer per unacked packet, following it across
-	// renumberings.
-	retransmitTimers map[uint32]*time.Timer
+	// largestAcked is the largest sequence the peer has acknowledged, -1 if
+	// none; lastAckTime when the last ACK that acknowledged something
+	// arrived, and ackBeforeLoss the one before the ACK (or timer) that last
+	// declared loss: persistent congestion asks whether anything was
+	// acknowledged since the oldest lost packet went out, which the ACK that
+	// revealed the loss does not answer.
+	largestAcked  int64
+	lastAckTime   time.Time
+	ackBeforeLoss time.Time
 
-	// Congestion controller reference (for RTO calculation)
+	// lossTimer fires when the oldest packet behind largestAcked becomes old
+	// enough to be lost without another ACK (the time threshold).
+	lossTimer *time.Timer
+
+	// Congestion controller reference (for the loss delay)
 	cc *CongestionController
 
-	// OnRetransmit puts a packet back on the wire. By the time it is called the
-	// packet's Sequence has already been advanced to a fresh number, so the
-	// callback only marshals and sends.
+	// OnRetransmit puts a packet back on the wire. By the time it is called
+	// the packet's Sequence has already been advanced to a fresh number, so
+	// the callback only marshals and sends.
 	OnRetransmit func(pkt *SentPacket, seq uint32)
+
+	// OnPacketsLost is told what loss detection declared lost, in sequence
+	// order, outside the manager's lock. The packets are no longer tracked:
+	// the receiver of this callback re-sends them (Resend) and books them.
+	OnPacketsLost func(lost []*SentPacket)
 }
 
 // NewPacketManager creates a new packet manager.
 func NewPacketManager(clock Clock, cc *CongestionController) *PacketManager {
 	return &PacketManager{
-		clock:            clock,
-		nextSeq:          0,
-		lastSentSeq:      -1,
-		sentPackets:      make(map[uint32]*SentPacket),
-		retransmitTimers: make(map[uint32]*time.Timer),
-		cc:               cc,
+		clock:        clock,
+		nextSeq:      0,
+		lastSentSeq:  -1,
+		sentPackets:  make(map[uint32]*SentPacket),
+		largestAcked: -1,
+		cc:           cc,
 	}
 }
 
@@ -74,190 +114,223 @@ func (pm *PacketManager) LastSentSeq() int {
 	return pm.lastSentSeq
 }
 
-// retransmitTimeout returns the RTO in milliseconds based on congestion controller RTT.
-func (pm *PacketManager) retransmitTimeout() time.Duration {
-	sRtt := pm.cc.SmoothedRtt()
-	rttVar := pm.cc.RttVar()
-
-	rtoMs := sRtt.Milliseconds() + 4*rttVar.Milliseconds()
-	if rtoMs < 200 {
-		rtoMs = 200
-	}
-	if rtoMs > 5000 {
-		rtoMs = 5000
-	}
-	return time.Duration(rtoMs) * time.Millisecond
+// LargestAcked is the largest sequence the peer has acknowledged, -1 if none.
+func (pm *PacketManager) LargestAcked() int64 {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.largestAcked
 }
 
-// retransmitBackoff returns how long to wait before the given attempt number
-// (1-based), backing off exponentially from the current RTO up to a ceiling.
-//
-// The ceiling never falls below the RTO itself. Capping below the round trip
-// would retransmit before the peer could possibly have answered, turning a slow
-// path into a flood of duplicates — so on a high-RTT link the RTO wins and the
-// backoff simply stops growing.
-func (pm *PacketManager) retransmitBackoff(attempt int) time.Duration {
-	rto := pm.retransmitTimeout()
-
-	ceiling := MaxRetransmitBackoff
-	if ceiling < rto {
-		ceiling = rto
-	}
-
-	backoff := ceiling
-	if shift := attempt - 1; shift < 32 {
-		if scaled := rto * time.Duration(1<<shift); scaled < ceiling {
-			backoff = scaled
-		}
-	}
-	if backoff < MinRetransmitTimeout {
-		backoff = MinRetransmitTimeout
-	}
-	return backoff
-}
-
-// SendPacket registers a sent packet for tracking and retransmission.
+// SendPacket registers a sent packet for tracking.
 func (pm *PacketManager) SendPacket(pkt *SentPacket) {
 	pm.mu.Lock()
-	pkt.SentTime = pm.clock.Now()
+	defer pm.mu.Unlock()
+	now := pm.clock.Now()
+	pkt.SentTime = now
+	if pkt.FirstSentTime.IsZero() {
+		pkt.FirstSentTime = now
+	}
 	pm.lastSentSeq = int(pkt.Sequence)
 	pm.sentPackets[pkt.Sequence] = pkt
-	pm.mu.Unlock()
-
-	pm.scheduleRetransmission(pkt)
 }
 
-// HandleAckFrame processes an ACK frame and returns newly acknowledged sequence numbers.
-// HandleAckFrame processes an ACK and returns the packets it newly acknowledged.
+// HandleAckFrame processes an ACK and returns the packets it newly
+// acknowledged. The caller books them with the congestion controller and
+// then runs DetectLostPackets, in that order (RFC 9002 appendix A.7: the
+// acknowledged bytes grow the window before the loss contracts it).
 //
 // It returns the *SentPacket values rather than bare sequence numbers because
-// the entries are deleted here: callers previously took the sequences and then
-// asked GetPacket for the size and send time, which always came back nil. That
-// silently starved the congestion controller of every ACK it should have seen —
-// inflight only ever grew, cwnd never left its initial value, and no RTT sample
-// was ever taken.
+// the entries are deleted here: the caller needs their size and send time.
 func (pm *PacketManager) HandleAckFrame(frame *AckFrame) []*SentPacket {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	var acked []*SentPacket
-
-	// Process first range: largestAcked down to largestAcked - firstAckRangeLength + 1
-	if frame.FirstAckRangeLength > 0 {
-		for i := uint32(0); i < frame.FirstAckRangeLength; i++ {
-			seq := frame.LargestAcked - i
-			if pkt, ok := pm.sentPackets[seq]; ok {
-				pkt.IsAcked = true
-				delete(pm.sentPackets, seq)
-				if t, ok := pm.retransmitTimers[seq]; ok {
-					t.Stop()
-					delete(pm.retransmitTimers, seq)
-				}
-				acked = append(acked, pkt)
-			}
+	take := func(seq uint32) {
+		if pkt, ok := pm.sentPackets[seq]; ok {
+			pkt.IsAcked = true
+			delete(pm.sentPackets, seq)
+			acked = append(acked, pkt)
 		}
 	}
 
-	// Process additional ACK ranges
+	// First range: largestAcked down to largestAcked - firstAckRangeLength + 1
+	for i := uint32(0); i < frame.FirstAckRangeLength; i++ {
+		take(frame.LargestAcked - i)
+	}
+
+	// Additional ranges, walking down. The next unacknowledged sequence after
+	// a range is rangeEnd - AckRangeLength: rangeEnd is the highest in the
+	// range and AckRangeLength of them were acked going down.
 	currentSeq := int64(frame.LargestAcked) - int64(frame.FirstAckRangeLength)
 	for _, r := range frame.AckRanges {
 		rangeEnd := currentSeq - int64(r.Gap)
 		for i := uint32(0); i < r.AckRangeLength; i++ {
-			seq := uint32(rangeEnd - int64(i))
-			if pkt, ok := pm.sentPackets[seq]; ok {
-				pkt.IsAcked = true
-				delete(pm.sentPackets, seq)
-				if t, ok := pm.retransmitTimers[seq]; ok {
-					t.Stop()
-					delete(pm.retransmitTimers, seq)
-				}
-				acked = append(acked, pkt)
-			}
+			take(uint32(rangeEnd - int64(i)))
 		}
-		// Advance past the range just acknowledged. The next unacknowledged
-		// sequence is rangeEnd - AckRangeLength: rangeEnd is the highest seq in
-		// the range and AckRangeLength of them were acked going down.
-		//
-		// This was rangeEnd - AckRangeLength - 1, one too low, which shifted
-		// every range after the first down by one. The sender then deleted
-		// sequences the peer had never acknowledged — so those packets were
-		// never retransmitted and the receiver waited for them forever, while
-		// sequences that really were acked stayed tracked. It only bites with
-		// two or more SACK ranges, i.e. multiple distinct losses in flight,
-		// which is why it showed up as loss-rate-dependent stalling rather than
-		// an outright failure. DetectLostPackets walks the same structure and
-		// has always done this correctly.
 		currentSeq = rangeEnd - int64(r.AckRangeLength)
 	}
 
+	if len(acked) > 0 {
+		pm.ackBeforeLoss = pm.lastAckTime
+		pm.lastAckTime = pm.clock.Now()
+		if int64(frame.LargestAcked) > pm.largestAcked {
+			pm.largestAcked = int64(frame.LargestAcked)
+		}
+	}
 	return acked
 }
 
-// Retransmit prepares an unacked packet to be re-sent under a FRESH sequence
-// number, returning the new sequence and true when the caller should send it.
+// DetectLostPackets runs loss detection over everything outstanding
+// (RFC 9002 section 6.1) and returns what it declared lost, also handed to
+// OnPacketsLost. The connection calls it after each ACK that acknowledged
+// something; the loss timer calls it when the time threshold elapses.
+func (pm *PacketManager) DetectLostPackets() []*SentPacket {
+	pm.mu.Lock()
+	lost := pm.detectLostLocked(pm.clock.Now())
+	pm.mu.Unlock()
+	if len(lost) > 0 && pm.OnPacketsLost != nil {
+		pm.OnPacketsLost(lost)
+	}
+	return lost
+}
+
+// detectLostLocked declares lost every outstanding packet below the largest
+// acknowledged that is LossReorderThreshold or more behind it, or older than
+// lossDelay (RFC 9002 section 6.1.1 and 6.1.2), removes them from tracking
+// and returns them in sequence order. Packets behind the largest acknowledged
+// but not yet old enough arm the loss timer for when the oldest will be.
 //
-// Reusing the original number is what made loss fatal. The retry budget rode on
-// the packet, so exhausting it left a hole the stream could never fill and the
-// stream was reset (ErrStreamReset). QUIC never reuses a packet number
-// (RFC 9000 section 12.3): lost data is re-framed into a new packet, and
-// delivery is bounded by the connection's idle timeout rather than a per-packet
-// count. Both v3 stacks reassemble streams on byte offsets, not sequence order,
-// so a fresh number is safe here — a duplicate is discarded by its offset, and
-// the retransmission is acknowledged unambiguously, so no Karn ambiguity
-// poisons the RTT estimate.
+// Every outstanding packet below the largest acknowledged is considered, not
+// only those in the frame's gaps: a receiver that acknowledges one packet at
+// a time sends no gaps, and the time threshold is then what declares loss.
+func (pm *PacketManager) detectLostLocked(now time.Time) []*SentPacket {
+	if pm.lossTimer != nil {
+		pm.lossTimer.Stop()
+		pm.lossTimer = nil
+	}
+	if pm.largestAcked < 0 {
+		return nil
+	}
+	delay := pm.lossDelay()
+	var lost []*SentPacket
+	var nextLoss time.Time
+	for seq, pkt := range pm.sentPackets {
+		if int64(seq) > pm.largestAcked {
+			continue
+		}
+		behind := pm.largestAcked - int64(seq)
+		if behind >= LossReorderThreshold || !now.Before(pkt.SentTime.Add(delay)) {
+			lost = append(lost, pkt)
+			continue
+		}
+		at := pkt.SentTime.Add(delay)
+		if nextLoss.IsZero() || at.Before(nextLoss) {
+			nextLoss = at
+		}
+	}
+	for _, pkt := range lost {
+		delete(pm.sentPackets, pkt.Sequence)
+	}
+	sort.Slice(lost, func(i, j int) bool { return lost[i].Sequence < lost[j].Sequence })
+	if !nextLoss.IsZero() {
+		wait := nextLoss.Sub(now)
+		if wait < LossTimerGranularity {
+			wait = LossTimerGranularity
+		}
+		pm.lossTimer = pm.clock.AfterFunc(wait, pm.onLossTimer)
+	}
+	return lost
+}
+
+// onLossTimer declares lost what has become old enough since the last ACK.
+func (pm *PacketManager) onLossTimer() {
+	pm.mu.Lock()
+	pm.ackBeforeLoss = pm.lastAckTime
+	lost := pm.detectLostLocked(pm.clock.Now())
+	pm.mu.Unlock()
+	if len(lost) > 0 && pm.OnPacketsLost != nil {
+		pm.OnPacketsLost(lost)
+	}
+}
+
+// LossTimerArmed reports whether a packet is waiting on the time threshold.
+func (pm *PacketManager) LossTimerArmed() bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.lossTimer != nil
+}
+
+// AckBeforeLoss is when the last ACK before the one that revealed the
+// current loss arrived (zero if none): whether anything was acknowledged
+// since a lost packet went out is what persistent congestion asks.
+func (pm *PacketManager) AckBeforeLoss() time.Time {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.ackBeforeLoss
+}
+
+// Resend gives a packet a FRESH sequence number for another transmission and
+// tracks it under that number, returning the number and true, or false when
+// the packet has been acknowledged and must not go out again.
 //
-// The re-key moves the tracking entry and the retransmit timer from the old
-// number to the new, bumps the attempt count, and — because a fresh sequence is
-// a fresh transmission — resets SentTime, so both the RTT sample and the loss
-// timer measure from now.
+// Reusing the original number is what made loss fatal: the retry budget rode
+// on the packet, so exhausting it left a hole the stream could never fill.
+// QUIC never reuses a packet number (RFC 9000 section 12.3): lost data is
+// re-framed into a new packet. Both v3 stacks reassemble streams on byte
+// offsets, so a fresh number is safe: a duplicate is discarded by its offset,
+// and the retransmission is acknowledged unambiguously.
 //
-// It touches neither inflight nor the congestion window: the bytes stay in
-// flight across the re-key. Congestion accounting is the caller's, and differs
-// by trigger — a timer-driven resend is a probe and changes nothing, while a
-// loss-detected resend pairs with OnCongestionEvent.
-//
-// Returns (0, false) when the packet was already acknowledged, or was
-// retransmitted within the last RTO — collapsing a near-simultaneous RTO timer
-// and SACK-driven retransmit into a single send.
-func (pm *PacketManager) Retransmit(pkt *SentPacket) (uint32, bool) {
+// The packet may be tracked (a PTO probe re-sends the oldest outstanding
+// packet, which stays outstanding) or not (loss detection removed it): either
+// way it is tracked under the new number afterwards, with SentTime reset so
+// the RTT sample and loss detection measure from this send. Congestion
+// accounting is the caller's: a probe's bytes are still in flight, a lost
+// packet's left flight when it was declared lost and are booked again by the
+// caller when it goes out.
+func (pm *PacketManager) Resend(pkt *SentPacket) (uint32, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	oldSeq := pkt.Sequence
-	if _, ok := pm.sentPackets[oldSeq]; !ok {
-		// Already acknowledged and removed; drop any lingering timer.
-		if t, ok := pm.retransmitTimers[oldSeq]; ok {
-			t.Stop()
-			delete(pm.retransmitTimers, oldSeq)
-		}
+	if pkt.IsAcked {
 		return 0, false
 	}
-
+	if cur, ok := pm.sentPackets[pkt.Sequence]; ok && cur == pkt {
+		delete(pm.sentPackets, pkt.Sequence)
+	}
 	now := pm.clock.Now()
-	if pkt.RetransmitCount > 0 && now.Sub(pkt.LastRetransmit) < pm.retransmitTimeout() {
-		// Another trigger re-sent this within the last RTO; one send is enough.
-		return 0, false
-	}
-
 	newSeq := pm.nextSeq
 	pm.nextSeq++
-
-	if t, ok := pm.retransmitTimers[oldSeq]; ok {
-		t.Stop()
-		delete(pm.retransmitTimers, oldSeq)
-	}
-	delete(pm.sentPackets, oldSeq)
-
 	pkt.Sequence = newSeq
 	pkt.RetransmitCount++
 	pkt.LastRetransmit = now
 	pkt.SentTime = now
+	if pkt.FirstSentTime.IsZero() {
+		pkt.FirstSentTime = now
+	}
+	pm.lastSentSeq = int(newSeq)
 	pm.sentPackets[newSeq] = pkt
-
-	backoff := pm.retransmitBackoff(pkt.RetransmitCount)
-	pm.retransmitTimers[newSeq] = pm.clock.AfterFunc(backoff, func() { pm.onRetransmitTimer(pkt) })
-
 	return newSeq, true
+}
+
+// OldestUnacked returns up to n outstanding packets, lowest sequence first:
+// what a PTO probe re-sends (RFC 9002 section 6.2.4). A re-send takes a fresh
+// sequence, so the lowest numbers are the longest unsent.
+func (pm *PacketManager) OldestUnacked(n int) []*SentPacket {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if len(pm.sentPackets) == 0 || n <= 0 {
+		return nil
+	}
+	all := make([]*SentPacket, 0, len(pm.sentPackets))
+	for _, pkt := range pm.sentPackets {
+		all = append(all, pkt)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Sequence < all[j].Sequence })
+	if len(all) > n {
+		all = all[:n]
+	}
+	return all
 }
 
 // GetPacket returns a sent packet by sequence number.
@@ -288,67 +361,6 @@ func (pm *PacketManager) lossDelay() time.Duration {
 	return delay
 }
 
-// DetectLostPackets examines SACK gaps in an AckFrame and returns sequence
-// numbers of packets that are inferred lost.
-//
-// A gap is suspicion, not proof: UDP reorders, and a packet that arrives late
-// still arrives. Following RFC 9002 section 6.1, a gap only counts as loss once
-// the packet is either LossReorderThreshold sequence numbers behind the largest
-// acknowledged one, or older than lossDelay. Until then it is presumed still in
-// flight. This used to declare every gap lost on sight, which is why reordering
-// cost far more than loss did.
-//
-// Packets retransmitted within the last RTO are skipped regardless, so a run of
-// ACKs describing the same gap cannot re-send the same packet repeatedly.
-func (pm *PacketManager) DetectLostPackets(frame *AckFrame) []uint32 {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	if len(frame.AckRanges) == 0 {
-		return nil
-	}
-
-	rto := pm.retransmitTimeout()
-	lossDelay := pm.lossDelay()
-	now := pm.clock.Now()
-	var lost []uint32
-
-	// Walk through the gaps between ACK ranges.
-	// After the first range, cursor points to the first sequence below it.
-	cursor := int64(frame.LargestAcked) - int64(frame.FirstAckRangeLength)
-
-	for _, r := range frame.AckRanges {
-		// The gap contains sequences that were NOT acknowledged.
-		for g := uint8(0); g < r.Gap; g++ {
-			if cursor < 0 {
-				break
-			}
-			seq := uint32(cursor)
-			if pkt, ok := pm.sentPackets[seq]; ok {
-				// Skip if already retransmitted recently.
-				if pkt.RetransmitCount > 0 && now.Sub(pkt.LastRetransmit) < rto {
-					cursor--
-					continue
-				}
-				// Neither far enough behind nor old enough: reordering still
-				// explains the gap, so leave it in flight. The RTO timer is the
-				// backstop if no further ACK ever resolves it.
-				behind := int64(frame.LargestAcked) - cursor
-				if behind < LossReorderThreshold && now.Sub(pkt.SentTime) < lossDelay {
-					cursor--
-					continue
-				}
-				lost = append(lost, seq)
-			}
-			cursor--
-		}
-		// Skip over the acked range.
-		cursor -= int64(r.AckRangeLength)
-	}
-
-	return lost
-}
-
 // PendingCount returns the number of unacked sent packets.
 func (pm *PacketManager) PendingCount() int {
 	pm.mu.Lock()
@@ -356,38 +368,13 @@ func (pm *PacketManager) PendingCount() int {
 	return len(pm.sentPackets)
 }
 
-// scheduleRetransmission arms the first RTO timer for a freshly-sent packet.
-// Every subsequent timer is armed by Retransmit as it re-keys the packet, so
-// there is exactly one live timer per unacked packet, following it across
-// renumberings. There is no per-packet retry cap: a packet is re-sent under a
-// fresh sequence until it is acknowledged or the connection's idle timeout
-// closes a path that has gone silent.
-func (pm *PacketManager) scheduleRetransmission(pkt *SentPacket) {
-	rto := pm.retransmitTimeout()
-	pm.mu.Lock()
-	pm.retransmitTimers[pkt.Sequence] = pm.clock.AfterFunc(rto, func() { pm.onRetransmitTimer(pkt) })
-	pm.mu.Unlock()
-}
-
-// onRetransmitTimer fires when a packet's RTO elapses without an ACK. It
-// re-keys the packet under a fresh sequence (which also arms the next timer)
-// and puts it back on the wire. A timer-driven resend is a probe, so it leaves
-// the congestion window alone — only ACK-based loss detection contracts it.
-func (pm *PacketManager) onRetransmitTimer(pkt *SentPacket) {
-	if newSeq, ok := pm.Retransmit(pkt); ok {
-		if pm.OnRetransmit != nil {
-			pm.OnRetransmit(pkt, newSeq)
-		}
-	}
-}
-
-// Destroy cancels all retransmission timers.
+// Destroy stops the loss timer and forgets every packet.
 func (pm *PacketManager) Destroy() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	for seq, t := range pm.retransmitTimers {
-		t.Stop()
-		delete(pm.retransmitTimers, seq)
+	if pm.lossTimer != nil {
+		pm.lossTimer.Stop()
+		pm.lossTimer = nil
 	}
 	pm.sentPackets = make(map[uint32]*SentPacket)
 }

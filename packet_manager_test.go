@@ -72,7 +72,8 @@ func TestPacketManager_AckWithRanges(t *testing.T) {
 	if len(acked) != 4 {
 		t.Fatalf("acked count: got %d, want 4", len(acked))
 	}
-	// Packets 0-4 and 7 should still be pending
+	// Packets 0-4 and 7 are still pending: loss is declared by
+	// DetectLostPackets, which the connection runs after booking the ACK.
 	if pm.PendingCount() != 6 {
 		t.Fatalf("pending after partial ack: got %d, want 6", pm.PendingCount())
 	}
@@ -124,9 +125,15 @@ func TestPacketManager_GetPacket(t *testing.T) {
 	}
 }
 
-func TestPacketManager_DetectLostPackets(t *testing.T) {
+// Loss is declared from acknowledgements (RFC 9002 section 6.1): a packet
+// below the largest acknowledged is lost once it is LossReorderThreshold
+// behind it, or older than the loss delay. What is lost leaves tracking and
+// goes to OnPacketsLost, in sequence order.
+func TestPacketManager_LossFromAckGaps(t *testing.T) {
 	pm, _, _ := newTestPM(t)
 	defer pm.Destroy()
+	var lost []*SentPacket
+	pm.OnPacketsLost = func(l []*SentPacket) { lost = append(lost, l...) }
 
 	// Send packets 0-9
 	for i := 0; i < 10; i++ {
@@ -134,89 +141,101 @@ func TestPacketManager_DetectLostPackets(t *testing.T) {
 		pm.SendPacket(&SentPacket{Sequence: seq, Size: 100, Frames: []Frame{&PingFrame{}}})
 	}
 
-	// ACK frame acknowledges {5,6,7,8,9} and {0,1,2} with gap at {3,4}.
-	// First range: 9 down to 5 (length 5)
-	// Gap: 2 (packets 4,3 missing)
-	// Second range: 2,1,0 (length 3)
-	ackFrame := &AckFrame{
+	// Acknowledge 5-9 and 0-2, leaving 3 and 4: both are at least three
+	// behind 9, so both are lost on this ACK.
+	pm.HandleAckFrame(&AckFrame{
 		LargestAcked:        9,
-		AckDelay:            0,
 		FirstAckRangeLength: 5, // acks 9,8,7,6,5
 		AckRanges: []AckRange{
 			{Gap: 2, AckRangeLength: 3}, // skip 4,3 then ack 2,1,0
 		},
-	}
+	})
+	pm.DetectLostPackets()
 
-	lost := pm.DetectLostPackets(ackFrame)
-	if len(lost) != 2 {
-		t.Fatalf("lost count: got %d, want 2", len(lost))
+	if len(lost) != 2 || lost[0].Sequence != 3 || lost[1].Sequence != 4 {
+		t.Fatalf("lost = %v, want packets 3 and 4 in order", seqsOf(lost))
 	}
-
-	// Should detect packets 4 and 3 as lost.
-	lostMap := map[uint32]bool{}
-	for _, seq := range lost {
-		lostMap[seq] = true
-	}
-	if !lostMap[3] || !lostMap[4] {
-		t.Fatalf("expected lost packets 3,4 but got %v", lost)
+	if pm.PendingCount() != 0 {
+		t.Fatalf("%d packets still tracked after everything was acked or lost", pm.PendingCount())
 	}
 }
 
-func TestPacketManager_DetectLostPackets_SkipsRecentRetransmit(t *testing.T) {
+// A receiver that acknowledges one packet at a time sends no ranges. The
+// packets below its largest are still declared lost: by the packet threshold
+// when far enough behind, by the time threshold otherwise. This is the
+// signal a go-udx sender never got from a dart-udx receiver.
+func TestPacketManager_LossFromSinglePacketAcks(t *testing.T) {
 	pm, _, clk := newTestPM(t)
 	defer pm.Destroy()
+	var lost []*SentPacket
+	pm.OnPacketsLost = func(l []*SentPacket) { lost = append(lost, l...) }
 
-	// Send packets 0-4
 	for i := 0; i < 5; i++ {
-		seq := pm.NextSequence()
-		pm.SendPacket(&SentPacket{Sequence: seq, Size: 100, Frames: []Frame{&PingFrame{}}})
+		pm.SendPacket(&SentPacket{Sequence: pm.NextSequence(), Size: 100, Frames: []Frame{&PingFrame{}}})
 	}
 
-	// Mark packet 2 as recently retransmitted.
-	pkt := pm.GetPacket(2)
-	pkt.RetransmitCount = 1
-	pkt.LastRetransmit = clk.Now()
-
-	// ACK frame: acks {3,4}, gap at {2}, acks {0,1}
-	ackFrame := &AckFrame{
-		LargestAcked:        4,
-		AckDelay:            0,
-		FirstAckRangeLength: 2, // acks 4,3
-		AckRanges: []AckRange{
-			{Gap: 1, AckRangeLength: 2}, // skip 2, ack 1,0
-		},
+	// Only 4 is acknowledged. 0 and 1 are three or more behind: lost now.
+	// 2 and 3 are not, and were just sent: they wait on the loss timer.
+	pm.HandleAckFrame(&AckFrame{LargestAcked: 4, FirstAckRangeLength: 1})
+	pm.DetectLostPackets()
+	if got := seqsOf(lost); len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("lost after the ACK = %v, want [0 1]", got)
+	}
+	if !pm.LossTimerArmed() {
+		t.Fatal("packets 2 and 3 are behind the largest acked but too young; the loss timer must be armed")
 	}
 
-	lost := pm.DetectLostPackets(ackFrame)
-	if len(lost) != 0 {
-		t.Fatalf("expected no lost packets (recently retransmitted), got %v", lost)
+	// Once they are older than the loss delay, the timer declares them lost
+	// without another ACK.
+	lost = nil
+	clk.Advance(pm.lossDelay() + time.Millisecond)
+	pm.onLossTimer()
+	if got := seqsOf(lost); len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("lost after the loss delay = %v, want [2 3]", got)
 	}
-
-	// Advance time past RTO, should now detect it.
-	clk.Advance(6 * time.Second)
-	lost = pm.DetectLostPackets(ackFrame)
-	if len(lost) != 1 || lost[0] != 2 {
-		t.Fatalf("expected lost [2] after RTO, got %v", lost)
+	if pm.LossTimerArmed() {
+		t.Fatal("nothing is waiting; the loss timer must not be armed")
 	}
 }
 
-func TestPacketManager_DetectLostPackets_NoRanges(t *testing.T) {
+// A packet that was re-sent is tracked under its fresh sequence, above the
+// largest acknowledged, so the same ACK cannot declare it lost twice.
+func TestPacketManager_ResentPacketIsNotLostAgainBySameAck(t *testing.T) {
 	pm, _, _ := newTestPM(t)
 	defer pm.Destroy()
+	var lost []*SentPacket
+	pm.OnPacketsLost = func(l []*SentPacket) { lost = append(lost, l...) }
 
-	pm.SendPacket(&SentPacket{Sequence: 0, Size: 100, Frames: []Frame{&PingFrame{}}})
-
-	// Simple ACK with no additional ranges — no gaps.
-	ackFrame := &AckFrame{
-		LargestAcked:        0,
-		AckDelay:            0,
-		FirstAckRangeLength: 1,
+	for i := 0; i < 5; i++ {
+		pm.SendPacket(&SentPacket{Sequence: pm.NextSequence(), Size: 100, Frames: []Frame{&PingFrame{}}})
 	}
-
-	lost := pm.DetectLostPackets(ackFrame)
+	pm.HandleAckFrame(&AckFrame{LargestAcked: 4, FirstAckRangeLength: 1})
+	pm.DetectLostPackets()
+	if len(lost) != 2 {
+		t.Fatalf("lost = %v, want packets 0 and 1", seqsOf(lost))
+	}
+	pkt := lost[0]
+	seq, ok := pm.Resend(pkt)
+	if !ok || seq != 5 {
+		t.Fatalf("Resend = (%d, %v), want the fresh sequence 5", seq, ok)
+	}
+	lost = nil
+	pm.HandleAckFrame(&AckFrame{LargestAcked: 4, FirstAckRangeLength: 1})
+	pm.DetectLostPackets()
 	if len(lost) != 0 {
-		t.Fatalf("expected no lost packets, got %v", lost)
+		t.Fatalf("the re-sent packet (now sequence 5) was declared lost by an ACK of 4: %v", seqsOf(lost))
 	}
+	if pm.GetPacket(5) != pkt {
+		t.Fatal("the re-sent packet is not tracked under its fresh sequence")
+	}
+}
+
+func seqsOf(pkts []*SentPacket) []uint32 {
+	out := make([]uint32, 0, len(pkts))
+	for _, p := range pkts {
+		out = append(out, p.Sequence)
+	}
+	return out
 }
 
 func TestPacketManager_Destroy(t *testing.T) {

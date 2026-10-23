@@ -138,28 +138,6 @@ func TestCongestionController_OnPacketLost(t *testing.T) {
 	}
 }
 
-func TestCongestionController_DuplicateAckFastRetransmit(t *testing.T) {
-	cc, _ := newTestCC(t)
-	defer cc.Destroy()
-
-	retransmitted := -1
-	cc.OnFastRetransmit = func(seq int) {
-		retransmitted = seq
-	}
-
-	// 3 duplicate ACKs for same largestAcked should trigger fast retransmit
-	cc.ProcessDuplicateAck(5)
-	cc.ProcessDuplicateAck(5)
-	cc.ProcessDuplicateAck(5)
-
-	if retransmitted != 6 { // largestAcked+1
-		t.Fatalf("expected fast retransmit for seq 6, got %d", retransmitted)
-	}
-	if !cc.InRecovery() {
-		t.Fatal("should be in recovery after 3 dup ACKs")
-	}
-}
-
 func TestCongestionController_NoGrowthDuringRecovery(t *testing.T) {
 	cc, clk := newTestCC(t)
 	defer cc.Destroy()

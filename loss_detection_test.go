@@ -310,22 +310,28 @@ func TestDetectLostPackets_HonoursTheReorderThreshold(t *testing.T) {
 	// Acknowledge 9 and 8, leaving 7 and below in a gap. Only packets at least
 	// LossReorderThreshold behind 9 may be declared lost, so 7 (one behind)
 	// must survive while 6 and below do not.
-	lost := pm.DetectLostPackets(&AckFrame{
+	var lost []*SentPacket
+	pm.OnPacketsLost = func(l []*SentPacket) { lost = append(lost, l...) }
+	pm.HandleAckFrame(&AckFrame{
 		LargestAcked:        9,
 		FirstAckRangeLength: 2, // 9 and 8
 		AckRanges:           []AckRange{{Gap: 4, AckRangeLength: 1}},
 	})
+	pm.DetectLostPackets()
 
-	for _, seq := range lost {
-		if behind := 9 - int(seq); behind < LossReorderThreshold {
+	for _, pkt := range lost {
+		if behind := 9 - int(pkt.Sequence); behind < LossReorderThreshold {
 			t.Errorf("sequence %d is only %d behind the largest acked and was "+
-				"declared lost; reordering still explains it", seq, behind)
+				"declared lost; reordering still explains it", pkt.Sequence, behind)
 		}
 	}
 	if len(lost) == 0 {
 		t.Fatal("nothing was declared lost; the threshold cannot be this permissive")
 	}
-	t.Logf("declared lost: %v", lost)
+	if pm.GetPacket(7) == nil {
+		t.Fatal("sequence 7, one behind the largest acked and just sent, must still be tracked")
+	}
+	t.Logf("declared lost: %v", seqsOf(lost))
 }
 
 // TestDetectLostPackets_TimeThresholdCatchesOldPackets is the other half: a
@@ -344,15 +350,15 @@ func TestDetectLostPackets_TimeThresholdCatchesOldPackets(t *testing.T) {
 		Size:     1200,
 	}
 
-	lost := pm.DetectLostPackets(&AckFrame{
-		LargestAcked:        3,
-		FirstAckRangeLength: 1,
-		AckRanges:           []AckRange{{Gap: 2, AckRangeLength: 1}},
-	})
+	pm.sentPackets[3] = &SentPacket{Sequence: 3, SentTime: now, Size: 1200}
+	var lost []*SentPacket
+	pm.OnPacketsLost = func(l []*SentPacket) { lost = append(lost, l...) }
+	pm.HandleAckFrame(&AckFrame{LargestAcked: 3, FirstAckRangeLength: 1})
+	pm.DetectLostPackets()
 
 	var found bool
-	for _, seq := range lost {
-		if seq == 2 {
+	for _, pkt := range lost {
+		if pkt.Sequence == 2 {
 			found = true
 		}
 	}

@@ -31,8 +31,8 @@ func newPacketManagerWithRTT(rtt time.Duration) *PacketManager {
 	return NewPacketManager(clk, cc)
 }
 
-// mockPacketManager builds a PacketManager on a controllable clock, so the RTO
-// timers never fire on their own and a test can drive retransmission by hand.
+// mockPacketManager builds a PacketManager on a controllable clock, so no
+// timer fires on its own and a test can drive loss and re-sends by hand.
 func mockPacketManager() (*PacketManager, *MockClock) {
 	clk := NewMockClock(time.Now())
 	cc := NewCongestionController(clk, func() int { return -1 })
@@ -59,9 +59,9 @@ func TestRetransmit_ReKeysUnderAFreshSequence(t *testing.T) {
 	pkt := dataPacket(seq)
 	pm.SendPacket(pkt)
 
-	newSeq, ok := pm.Retransmit(pkt)
+	newSeq, ok := pm.Resend(pkt)
 	if !ok {
-		t.Fatal("Retransmit returned false for an unacknowledged packet")
+		t.Fatal("Resend returned false for an unacknowledged packet")
 	}
 	if newSeq == seq {
 		t.Fatalf("retransmit reused sequence %d; a fresh number was required", seq)
@@ -92,9 +92,9 @@ func TestRetransmit_ResetsTheSentTime(t *testing.T) {
 	pm.SendPacket(pkt)
 	original := pkt.SentTime
 
-	clk.Advance(pm.retransmitTimeout() + time.Second)
-	if _, ok := pm.Retransmit(pkt); !ok {
-		t.Fatal("Retransmit returned false for an unacknowledged packet")
+	clk.Advance(pm.cc.PTO() + time.Second)
+	if _, ok := pm.Resend(pkt); !ok {
+		t.Fatal("Resend returned false for an unacknowledged packet")
 	}
 	if !pkt.SentTime.After(original) {
 		t.Fatalf("SentTime %v was not advanced past the original %v", pkt.SentTime, original)
@@ -104,33 +104,9 @@ func TestRetransmit_ResetsTheSentTime(t *testing.T) {
 	}
 }
 
-// TestRetransmit_CollapsesTriggersWithinAnRTO guards the two triggers — the RTO
-// timer and SACK-driven loss detection — from re-sending the same packet twice
-// for one loss. A second attempt inside the RTO is dropped; once the RTO has
-// elapsed, a genuine re-send proceeds.
-func TestRetransmit_CollapsesTriggersWithinAnRTO(t *testing.T) {
-	pm, clk := mockPacketManager()
-
-	seq := pm.NextSequence()
-	pkt := dataPacket(seq)
-	pm.SendPacket(pkt)
-
-	if _, ok := pm.Retransmit(pkt); !ok {
-		t.Fatal("the first retransmit should proceed")
-	}
-	if _, ok := pm.Retransmit(pkt); ok {
-		t.Fatal("a second retransmit within the RTO should be collapsed into the first")
-	}
-
-	clk.Advance(pm.retransmitTimeout())
-	if _, ok := pm.Retransmit(pkt); !ok {
-		t.Fatal("after the RTO elapses a real retransmit should proceed")
-	}
-}
-
-// TestRetransmit_OnAnAckedPacketIsANoop makes sure a retransmit trigger that
-// races an ACK does nothing: the packet is gone from tracking, so there is
-// nothing to re-send and no timer to leak.
+// TestRetransmit_OnAnAckedPacketIsANoop makes sure a re-send that races an
+// ACK does nothing: the packet is acknowledged, so there is nothing to send
+// and nothing to track.
 func TestRetransmit_OnAnAckedPacketIsANoop(t *testing.T) {
 	pm, _ := mockPacketManager()
 
@@ -140,74 +116,23 @@ func TestRetransmit_OnAnAckedPacketIsANoop(t *testing.T) {
 
 	pm.HandleAckFrame(&AckFrame{LargestAcked: seq, FirstAckRangeLength: 1})
 
-	if _, ok := pm.Retransmit(pkt); ok {
-		t.Fatal("retransmit of an acknowledged packet should be a no-op")
+	if _, ok := pm.Resend(pkt); ok {
+		t.Fatal("re-send of an acknowledged packet should be a no-op")
 	}
-	if len(pm.retransmitTimers) != 0 {
-		t.Fatalf("a retransmit timer leaked for an acked packet: %d remain", len(pm.retransmitTimers))
+	if pm.PendingCount() != 0 {
+		t.Fatalf("an acknowledged packet is tracked again after a re-send attempt: %d pending", pm.PendingCount())
 	}
-}
-
-// TestRetransmitBackoff_IsCappedAndNeverBelowRTO covers both halves of the cap.
-//
-// It grows exponentially, saturates rather than running away, and — the part
-// that is easy to get wrong — the ceiling never drops below the RTO. Capping
-// below the round trip would retransmit before the peer could possibly have
-// answered, so a slow path would be answered with a flood of duplicates.
-func TestRetransmitBackoff_IsCappedAndNeverBelowRTO(t *testing.T) {
-	// There is no per-packet retry cap any more, so the schedule is unbounded;
-	// a generous span is enough to prove the shape.
-	const attempts = 20
-
-	t.Run("fast path saturates at the cap", func(t *testing.T) {
-		pm := newPacketManagerWithRTT(0) // no samples: RTO sits at the 200ms floor
-		rto := pm.retransmitTimeout()
-
-		var prev time.Duration
-		for attempt := 1; attempt <= attempts; attempt++ {
-			got := pm.retransmitBackoff(attempt)
-			if got > MaxRetransmitBackoff {
-				t.Fatalf("attempt %d: backoff %v exceeds the %v cap", attempt, got, MaxRetransmitBackoff)
-			}
-			if got < rto {
-				t.Fatalf("attempt %d: backoff %v is below the RTO %v", attempt, got, rto)
-			}
-			if got < prev {
-				t.Fatalf("attempt %d: backoff went backwards, %v after %v", attempt, got, prev)
-			}
-			prev = got
-		}
-		if prev != MaxRetransmitBackoff {
-			t.Fatalf("backoff saturated at %v, want the %v cap", prev, MaxRetransmitBackoff)
-		}
-	})
-
-	t.Run("slow path never retransmits faster than the round trip", func(t *testing.T) {
-		// An RTT well above the cap: the RTO must win, not MaxRetransmitBackoff.
-		pm := newPacketManagerWithRTT(3 * time.Second)
-		rto := pm.retransmitTimeout()
-		if rto <= MaxRetransmitBackoff {
-			t.Fatalf("RTO %v did not exceed the cap %v; the test proves nothing", rto, MaxRetransmitBackoff)
-		}
-
-		for attempt := 1; attempt <= attempts; attempt++ {
-			if got := pm.retransmitBackoff(attempt); got < rto {
-				t.Fatalf("attempt %d: backoff %v is shorter than the RTO %v — "+
-					"this retransmits before the peer could have answered", attempt, got, rto)
-			}
-		}
-	})
 }
 
 // TestIdleTimeout_IsAtLeastThreePTO pins the relationship that keeps loss
 // recovery from being cut off: the idle timeout is never shorter than three
-// PTOs, and never shorter than the MaxIdleTimeout floor. The RTO is capped, so
+// PTOs, and never shorter than the MaxIdleTimeout floor. The PTO is capped, so
 // the floor wins today; the max() is what stays correct if the cap ever rises.
 func TestIdleTimeout_IsAtLeastThreePTO(t *testing.T) {
 	clk := NewMockClock(time.Now())
 	c, _, _ := connWithStreamClock(t, clk)
 
-	pto := c.pm.retransmitTimeout()
+	pto := c.cc.PTO()
 	if got := c.idleTimeout(); got < 3*pto {
 		t.Fatalf("idle timeout %v is below three PTOs (%v)", got, 3*pto)
 	}
@@ -390,9 +315,13 @@ func connWithStreamClock(t *testing.T, clk Clock) (*Connection, *Stream, *resetC
 type resetCountingSink struct {
 	mu     sync.Mutex
 	resets int
+	sent   int
 }
 
 func (r *resetCountingSink) send(data []byte, _ net.Addr) error {
+	r.mu.Lock()
+	r.sent++
+	r.mu.Unlock()
 	pkt, err := UnmarshalPacket(data)
 	if err != nil {
 		return nil
@@ -411,4 +340,11 @@ func (r *resetCountingSink) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.resets
+}
+
+// datagrams is how many datagrams went to the sink in all.
+func (r *resetCountingSink) datagrams() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sent
 }

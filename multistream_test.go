@@ -560,65 +560,40 @@ func (c *disorderlyPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	}
 }
 
-// TestMultiStream_OneStreamStallDoesNotBlockAnother is the property the byte
-// offsets were added for.
+// TestMultiStream_OneStreamStallDoesNotBlockAnother: a stream whose reader
+// has stopped consuming stalls on its own flow-control limit and nothing
+// else; a sibling stream on the same connection finishes meanwhile.
 //
-// Delivery order used to come from the packet sequence number, which is
-// allocated per connection. A gap in it stalled the connection's reassembly, so
-// every stream waited on the missing packet regardless of which stream it
-// belonged to — one slow or lossy stream held up all its siblings. With STREAM
-// frames carrying their own offsets, a stream is delayed only by its own bytes.
-//
-// The path here blocks one stream completely for a fixed period. The other must
-// finish well inside it.
+// This used to stall the stream by dropping every one of its packets on the
+// path for three seconds. That is not a stalled stream, it is a lossy path,
+// and under shared congestion control (RFC 9002: loss on any stream is a
+// signal about the path) every re-send lost again contracts the window
+// until the connection crawls; QUIC couples streams there by design. The
+// old per-packet retransmission timers passed it only because their
+// re-sends bypassed the window. The stall a stream can have by itself is
+// flow control, which is what this now exercises.
 func TestMultiStream_OneStreamStallDoesNotBlockAnother(t *testing.T) {
 	if testing.Short() {
-		t.Skip("waits out a deliberate stall; skipped under -short")
+		t.Skip("waits on a deliberately unread stream; skipped under -short")
 	}
 
-	const stalled = 8 << 10   // small, so the blocked stream does not eat the window
+	const stalled = 1 << 20   // well past the unread stream's window, so its writer blocks
 	const flowing = 256 << 10 // large enough that finishing early is meaningful
-	const blockFor = 3 * time.Second
+	const within = 3 * time.Second
 
-	serverUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	conn, srvConn, ctx := testPair(t, 60*time.Second)
+
+	blocked, err := conn.OpenStream(ctx) // stream 1: the server never reads it
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Stream IDs are odd for the initiator, so the client's first stream is 1.
-	path := &streamBlockingPath{PacketConn: clientUDP, blockStream: 1, until: time.Now().Add(blockFor)}
-
-	server := NewMultiplexer(serverUDP, RealClock{})
-	client := NewMultiplexer(path, RealClock{})
-	t.Cleanup(func() { client.Close(); server.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	t.Cleanup(cancel)
-
-	conn, err := client.Dial(ctx, server.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	srvConn, err := server.Accept(ctx)
+	open, err := conn.OpenStream(ctx) // stream 3: read as it arrives
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	blocked, err := conn.OpenStream(ctx) // stream 1, the one the path holds
-	if err != nil {
-		t.Fatal(err)
-	}
-	open, err := conn.OpenStream(ctx) // stream 3, unimpeded
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Each stream announces itself by size, since the server accepts them in
-	// whatever order their first packet lands.
+	// The server reads only the flowing stream, which announces itself by
+	// its first bytes' size; the other is accepted and left unread.
 	done := make(chan int, 2)
 	go func() {
 		for i := 0; i < 2; i++ {
@@ -626,9 +601,12 @@ func TestMultiStream_OneStreamStallDoesNotBlockAnother(t *testing.T) {
 			if err != nil {
 				return
 			}
+			if s.RemoteID == blocked.ID {
+				continue // accepted, never read: its window fills and stays full
+			}
 			go func(s *Stream) {
 				got, err := drain(s, flowing, 40*time.Second)
-				if err != nil && len(got) != stalled {
+				if err != nil {
 					done <- -1
 					return
 				}
@@ -638,52 +616,39 @@ func TestMultiStream_OneStreamStallDoesNotBlockAnother(t *testing.T) {
 	}()
 
 	started := time.Now()
+	blockedDone := make(chan error, 1)
 	go func() {
 		blocked.SetWriteDeadline(time.Now().Add(40 * time.Second))
-		blocked.Write(pattern(stalled))
+		_, err := blocked.Write(pattern(stalled))
+		blockedDone <- err
 	}()
 	go func() {
 		open.SetWriteDeadline(time.Now().Add(40 * time.Second))
 		open.Write(pattern(flowing))
 	}()
 
-	// The first stream to finish must be the unimpeded one, and it must finish
-	// before the block is lifted. Waiting for the block to expire would mean the
-	// two streams are still coupled.
 	select {
 	case n := <-done:
 		elapsed := time.Since(started)
 		if n != flowing {
-			t.Fatalf("first stream to complete carried %d bytes, want the unblocked stream's %d", n, flowing)
+			t.Fatalf("the flowing stream delivered %d bytes, want %d", n, flowing)
 		}
-		if elapsed >= blockFor {
-			t.Fatalf("the unblocked stream took %v to finish, longer than the %v stall on its "+
-				"sibling — the streams are still coupled", elapsed.Round(time.Millisecond), blockFor)
+		if elapsed >= within {
+			t.Fatalf("the flowing stream took %v to finish beside a stalled sibling; "+
+				"the streams are coupled", elapsed.Round(time.Millisecond))
 		}
-		t.Logf("unblocked stream completed in %v while its sibling was stalled for %v",
-			elapsed.Round(time.Millisecond), blockFor)
+		t.Logf("flowing stream completed in %v beside a stalled sibling", elapsed.Round(time.Millisecond))
 	case <-time.After(40 * time.Second):
-		t.Fatal("neither stream completed")
+		t.Fatal("the flowing stream never completed")
 	}
-}
 
-// streamBlockingPath discards every data packet belonging to one stream until a
-// deadline, leaving all other traffic untouched. Retransmissions are discarded
-// too, so the stream is genuinely stalled rather than merely delayed.
-type streamBlockingPath struct {
-	net.PacketConn
-	blockStream uint32
-	until       time.Time
-}
-
-func (c *streamBlockingPath) WriteTo(b []byte, addr net.Addr) (int, error) {
-	if time.Now().Before(c.until) {
-		if pkt, err := UnmarshalPacket(b); err == nil &&
-			pkt.SourceStreamID == c.blockStream && isDataBearing(pkt) {
-			return len(b), nil
-		}
+	// The stalled stream is still blocked on its flow-control limit, not
+	// finished and not failed.
+	select {
+	case err := <-blockedDone:
+		t.Fatalf("the unread stream's writer returned (%v) instead of waiting on flow control", err)
+	default:
 	}
-	return c.PacketConn.WriteTo(b, addr)
 }
 
 // TestHandleStreamFrame_DataBeforeSynOpensTheStream pins the second thing that
