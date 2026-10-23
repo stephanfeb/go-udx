@@ -87,7 +87,13 @@ const (
 
 // Timeouts
 const (
-	InitialRTT       = 333 * time.Millisecond
+	// InitialRTT is the smoothed RTT before the first sample (RFC 9002
+	// section 6.2.2), with InitialRTTVar its variation: the first PTO is
+	// about a second. The estimate used to start at 100 ms, so on a slow
+	// path the first probe went out before the handshake could answer.
+	InitialRTT    = 333 * time.Millisecond
+	InitialRTTVar = InitialRTT / 2
+
 	MaxIdleTimeout   = 30 * time.Second
 	HandshakeTimeout = 10 * time.Second
 )
@@ -143,12 +149,6 @@ const (
 const (
 	RTTAlpha = 0.125 // 1/8
 	RTTBeta  = 0.25  // 1/4
-)
-
-// PTO bounds
-const (
-	MinPTO = 200 * time.Millisecond
-	MaxPTO = 5 * time.Second
 )
 
 // Loss detection

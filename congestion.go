@@ -23,7 +23,8 @@ type CongestionController struct {
 	k          float64 // Time for window to grow back to wMax (seconds)
 	epochStart time.Time
 
-	// RTT estimation (RFC 9002 Section 5)
+	// RTT estimation (RFC 9002 Section 5). Until the first sample
+	// smoothedRtt and rttVar are the initial estimates and minRtt is zero.
 	smoothedRtt    time.Duration
 	rttVar         time.Duration
 	minRtt         time.Duration
@@ -67,9 +68,8 @@ func NewCongestionController(clock Clock, lastSentSeqFn func() int) *CongestionC
 		// the window crawled up from there at CUBIC's pace: on a 40 ms
 		// path 4 MB took two seconds with no loss at all.
 		ssthresh:       math.MaxInt,
-		smoothedRtt:    100 * time.Millisecond,
-		rttVar:         50 * time.Millisecond,
-		minRtt:         time.Second,
+		smoothedRtt:    InitialRTT,
+		rttVar:         InitialRTTVar,
 		firstRttSample: true,
 		recoveryEndSeq: -1,
 		Pacer:          NewPacingController(clock),
@@ -116,7 +116,7 @@ func (cc *CongestionController) LatestRtt() time.Duration {
 	return cc.latestRtt
 }
 
-// MinRtt returns the minimum observed RTT.
+// MinRtt returns the minimum observed RTT, zero before the first sample.
 func (cc *CongestionController) MinRtt() time.Duration {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -138,9 +138,13 @@ func (cc *CongestionController) InRecovery() bool {
 }
 
 // PTO returns the base Probe Timeout (RFC 9002 section 6.2.1):
-// smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay, within
-// [MinPTO, MaxPTO]. The peer delays its ACKs by up to MaxAckDelay, so a PTO
-// without that term fires on a delayed ACK alone.
+// smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay. The peer
+// delays its ACKs by up to MaxAckDelay, so a PTO without that term fires on
+// a delayed ACK alone. There is no floor beyond the granularity and no cap:
+// on a 30 ms path a loss costs about 60 ms, not the 200 ms floor that used
+// to stand in for the missing max_ack_delay term, and a slow path's PTO is
+// bounded by the backoff and the idle timeout, not by a constant. Before
+// the first sample it is about a second (InitialRTT).
 func (cc *CongestionController) PTO() time.Duration {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -152,14 +156,7 @@ func (cc *CongestionController) pto() time.Duration {
 	if v < LossTimerGranularity {
 		v = LossTimerGranularity
 	}
-	pto := cc.smoothedRtt + v + MaxAckDelay
-	if pto < MinPTO {
-		pto = MinPTO
-	}
-	if pto > MaxPTO {
-		pto = MaxPTO
-	}
-	return pto
+	return cc.smoothedRtt + v + MaxAckDelay
 }
 
 // PTOCount is how many PTOs have fired since the last ACK; the next PTO
@@ -262,39 +259,46 @@ func (cc *CongestionController) updatePacingRate() {
 	cc.Pacer.UpdateRate(cc.cwnd, cc.smoothedRtt, cc.cwnd < cc.ssthresh)
 }
 
-// updateRtt updates RTT estimates based on a new sample.
+// updateRtt updates the RTT estimates from a new sample (RFC 9002
+// sections 5.1-5.3). The first sample replaces the initial estimates and
+// stands as measured. Later samples are adjusted for the receiver's reported
+// ACK delay (capped at MaxAckDelay), but only when the sample is at least
+// min_rtt + ack_delay: a delay that would take the sample below the minimum
+// ever seen is not credible, and min_rtt itself is always taken from the
+// unadjusted sample.
 func (cc *CongestionController) updateRtt(sentTime time.Time, ackDelay time.Duration) {
-	now := cc.clock.Now()
-
-	// Cap ack_delay per RFC 9002
-	cappedDelay := ackDelay
-	if cappedDelay > MaxAckDelay {
-		cappedDelay = MaxAckDelay
+	latest := cc.clock.Now().Sub(sentTime)
+	if latest < 0 {
+		return // not a sample
 	}
 
-	cc.latestRtt = now.Sub(sentTime)
-	if cc.latestRtt > cappedDelay {
-		cc.latestRtt -= cappedDelay
-	}
-
-	if cc.latestRtt < cc.minRtt {
-		cc.minRtt = cc.latestRtt
-	}
-
-	// RFC 9002 Section 5.1
 	if cc.firstRttSample {
 		cc.firstRttSample = false
-		cc.smoothedRtt = cc.latestRtt
-		cc.rttVar = cc.latestRtt / 2
-	} else {
-		rttVarSample := cc.smoothedRtt - cc.latestRtt
-		if rttVarSample < 0 {
-			rttVarSample = -rttVarSample
-		}
-		// beta = 1/4, alpha = 1/8
-		cc.rttVar = (3*cc.rttVar + rttVarSample) / 4
-		cc.smoothedRtt = (7*cc.smoothedRtt + cc.latestRtt) / 8
+		cc.latestRtt = latest
+		cc.minRtt = latest
+		cc.smoothedRtt = latest
+		cc.rttVar = latest / 2
+		return
 	}
+
+	if latest < cc.minRtt {
+		cc.minRtt = latest
+	}
+	if ackDelay > MaxAckDelay {
+		ackDelay = MaxAckDelay
+	}
+	if latest >= cc.minRtt+ackDelay {
+		latest -= ackDelay
+	}
+	cc.latestRtt = latest
+
+	rttVarSample := cc.smoothedRtt - latest
+	if rttVarSample < 0 {
+		rttVarSample = -rttVarSample
+	}
+	// beta = 1/4, alpha = 1/8
+	cc.rttVar = (3*cc.rttVar + rttVarSample) / 4
+	cc.smoothedRtt = (7*cc.smoothedRtt + latest) / 8
 }
 
 // cubicUpdate performs CUBIC window increase.

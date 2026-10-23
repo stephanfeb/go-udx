@@ -56,14 +56,15 @@ func TestCongestionController_RTTFirstSample(t *testing.T) {
 	clk.Advance(80 * time.Millisecond)
 	cc.OnPacketAcked(1000, sentTime, 5*time.Millisecond, true, 1)
 
-	// First sample: smoothedRtt = latestRtt = 80ms - 5ms = 75ms
+	// The first sample stands as measured (RFC 9002 section 5.3): min_rtt is
+	// the sample itself, so it is never at least min_rtt + ack_delay.
 	sRtt := cc.SmoothedRtt()
-	if sRtt != 75*time.Millisecond {
-		t.Fatalf("smoothedRtt: got %v, want 75ms", sRtt)
+	if sRtt != 80*time.Millisecond {
+		t.Fatalf("smoothedRtt: got %v, want 80ms", sRtt)
 	}
-	// rttVar = latestRtt / 2 = 37.5ms
+	// rttVar = latestRtt / 2
 	rVar := cc.RttVar()
-	expected := 75 * time.Millisecond / 2
+	expected := 80 * time.Millisecond / 2
 	if rVar != expected {
 		t.Fatalf("rttVar: got %v, want %v", rVar, expected)
 	}
@@ -97,16 +98,20 @@ func TestCongestionController_AckDelayCappping(t *testing.T) {
 	cc, clk := newTestCC(t)
 	defer cc.Destroy()
 
-	sentTime := clk.Now()
+	sent1 := clk.Now()
+	cc.OnPacketSent(1000)
+	clk.Advance(50 * time.Millisecond)
+	cc.OnPacketAcked(1000, sent1, 0, true, 1) // min_rtt 50 ms
+
+	sent2 := clk.Now()
 	cc.OnPacketSent(1000)
 	clk.Advance(100 * time.Millisecond)
-	// ackDelay larger than MaxAckDelay should be capped
-	cc.OnPacketAcked(1000, sentTime, 50*time.Millisecond, true, 1)
+	// ackDelay larger than MaxAckDelay is capped
+	cc.OnPacketAcked(1000, sent2, 50*time.Millisecond, true, 2)
 
 	// latestRtt = 100ms - 25ms (capped) = 75ms
-	sRtt := cc.SmoothedRtt()
-	if sRtt != 75*time.Millisecond {
-		t.Fatalf("smoothedRtt: got %v, want 75ms (ack delay should be capped)", sRtt)
+	if cc.LatestRtt() != 75*time.Millisecond {
+		t.Fatalf("latestRtt: got %v, want 75ms (ack delay should be capped)", cc.LatestRtt())
 	}
 }
 

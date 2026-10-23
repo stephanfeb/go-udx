@@ -157,8 +157,11 @@ func TestLoss_PersistentCongestionCollapsesTheWindow(t *testing.T) {
 		t.Fatalf("cwnd %d is already at the minimum; the test proves nothing", c.cc.Cwnd())
 	}
 
-	// The last one is acknowledged: everything before it is lost, over a span
-	// of three PTOs, with no ACK in between.
+	// The last one is acknowledged after a round trip: everything before it
+	// is lost, over a span of three PTOs, with no ACK in between. (Acked at
+	// once it would be a zero RTT sample, which moves the PTO the span is
+	// measured against.)
+	clk.Advance(50 * time.Millisecond)
 	last := uint32(c.pm.LastSentSeq())
 	c.HandlePacket(&Packet{Version: VersionCurrent, Frames: []Frame{&AckFrame{LargestAcked: last, FirstAckRangeLength: 1}}})
 
@@ -179,7 +182,7 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 		t.Skip("waits out a three-second gap; skipped under -short")
 	}
 	var dropping int32
-	var sent int64
+	var sent, cutAt int64
 	serverUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +192,7 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := NewMultiplexer(serverUDP, RealClock{})
-	client := NewMultiplexer(&countingBlackhole{PacketConn: clientUDP, dropping: &dropping, sent: &sent}, RealClock{})
+	client := NewMultiplexer(&countingBlackhole{PacketConn: clientUDP, dropping: &dropping, sent: &sent, cutAt: &cutAt}, RealClock{})
 	t.Cleanup(func() { client.Close(); server.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -221,12 +224,9 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 		read <- err
 	}()
 
-	// Cut the path as soon as the first bytes are out, so a window is in
-	// flight when it goes dark.
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		atomic.StoreInt32(&dropping, 1)
-	}()
+	// Cut the path once the first datagrams are out (the handshake and the
+	// start of the write), so a window is in flight when it goes dark.
+	atomic.StoreInt64(&cutAt, atomic.LoadInt64(&sent)+8)
 	s.SetWriteDeadline(time.Now().Add(50 * time.Second))
 	writeDone := make(chan error, 1)
 	go func() {
@@ -236,20 +236,25 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond) // the cut is in place and the window is full
 	atStart := atomic.LoadInt64(&sent)
+	base := conn.cc.PTO() // nothing is sampled in the gap, so this is the base throughout
 	const gap = 3 * time.Second
 	time.Sleep(gap)
 	during := atomic.LoadInt64(&sent) - atStart
 	atomic.StoreInt32(&dropping, 0)
 
-	// On loopback the PTO sits at its floor; expirations in the gap are at
-	// 1, 3, 7, 15 PTOs: four at most, each sending ptoProbes datagrams.
+	// Expirations in the gap are at 1, 3, 7, 15, ... PTOs, each sending
+	// ptoProbes datagrams: on loopback the PTO is about max_ack_delay, 25 ms,
+	// so seven in three seconds.
 	expirations := 0
-	for at := MinPTO; at < gap; at = at*2 + MinPTO {
+	for at := base; at < gap; at = at*2 + base {
 		expirations++
 	}
 	if limit := int64(ptoProbes*expirations + 2); during > limit {
 		t.Fatalf("%d datagrams were sent into a %v gap; want at most %d (%d PTOs x %d probes)",
 			during, gap, limit, expirations, ptoProbes)
+	}
+	if during < ptoProbes {
+		t.Fatalf("%d datagrams were sent into a %v gap; want at least one PTO's %d probes", during, gap, ptoProbes)
 	}
 	t.Logf("%d datagrams sent into the %v gap", during, gap)
 
@@ -261,17 +266,98 @@ func TestPTO_AGapSendsProbesNotTheWindow(t *testing.T) {
 	}
 }
 
-// countingBlackhole counts datagrams and discards them while dropping is set.
+// countingBlackhole counts datagrams and discards them while dropping is
+// set, which it sets itself once, at the cutAt-th datagram, when cutAt is
+// set.
 type countingBlackhole struct {
 	net.PacketConn
 	dropping *int32
 	sent     *int64
+	cutAt    *int64
 }
 
 func (c *countingBlackhole) WriteTo(b []byte, addr net.Addr) (int, error) {
-	atomic.AddInt64(c.sent, 1)
+	n := atomic.AddInt64(c.sent, 1)
+	if cut := atomic.LoadInt64(c.cutAt); cut > 0 && n == cut {
+		atomic.StoreInt32(c.dropping, 1)
+	}
 	if atomic.LoadInt32(c.dropping) == 1 {
 		return len(b), nil
 	}
 	return c.PacketConn.WriteTo(b, addr)
+}
+
+// Before the first sample the estimates are RFC 9002 section 6.2.2's: a
+// 333 ms RTT, so the first PTO is about a second, long enough for a slow
+// path's handshake to answer before it is probed.
+func TestPTO_InitialEstimates(t *testing.T) {
+	clk := NewMockClock(time.Now())
+	cc := NewCongestionController(clk, nil)
+	if cc.SmoothedRtt() != InitialRTT || cc.RttVar() != InitialRTT/2 {
+		t.Fatalf("initial srtt %v, rttvar %v; want %v, %v", cc.SmoothedRtt(), cc.RttVar(), InitialRTT, InitialRTT/2)
+	}
+	if cc.MinRtt() != 0 {
+		t.Fatalf("min_rtt %v before any sample; want none", cc.MinRtt())
+	}
+	if want := InitialRTT + 4*InitialRTTVar + MaxAckDelay; cc.PTO() != want {
+		t.Fatalf("initial PTO %v, want %v", cc.PTO(), want)
+	}
+
+	// The first sample replaces all of it.
+	sent := clk.Now()
+	cc.OnPacketSent(1000)
+	clk.Advance(20 * time.Millisecond)
+	cc.OnPacketAcked(1000, sent, 40*time.Millisecond, true, 0)
+	if cc.SmoothedRtt() != 20*time.Millisecond || cc.MinRtt() != 20*time.Millisecond || cc.RttVar() != 10*time.Millisecond {
+		t.Fatalf("after the first sample: srtt %v, min %v, rttvar %v", cc.SmoothedRtt(), cc.MinRtt(), cc.RttVar())
+	}
+}
+
+// The PTO has no floor beyond the timer granularity: on a 20 ms path with
+// 2 ms of variation it is 20 + 8 + 25 ms, not 200.
+func TestPTO_NoFloor(t *testing.T) {
+	clk := NewMockClock(time.Now())
+	cc := NewCongestionController(clk, nil)
+	cc.SetSmoothedRtt(20 * time.Millisecond)
+	cc.SetRttVar(2 * time.Millisecond)
+	if want := 53 * time.Millisecond; cc.PTO() != want {
+		t.Fatalf("PTO %v, want %v", cc.PTO(), want)
+	}
+	// And no cap: a slow path's PTO is its RTT's.
+	cc.SetSmoothedRtt(8 * time.Second)
+	cc.SetRttVar(time.Second)
+	if want := 12*time.Second + MaxAckDelay; cc.PTO() != want {
+		t.Fatalf("PTO %v, want %v", cc.PTO(), want)
+	}
+}
+
+// Later samples are adjusted for the reported ACK delay only when the
+// sample is at least min_rtt + ack_delay (RFC 9002 section 5.3), and
+// min_rtt is taken from the unadjusted sample.
+func TestRTT_AckDelayAdjustment(t *testing.T) {
+	clk := NewMockClock(time.Now())
+	cc := NewCongestionController(clk, nil)
+	sample := func(rtt, ackDelay time.Duration) {
+		sent := clk.Now()
+		cc.OnPacketSent(1000)
+		clk.Advance(rtt)
+		cc.OnPacketAcked(1000, sent, ackDelay, true, 0)
+	}
+	sample(50*time.Millisecond, 0) // min_rtt 50 ms
+	sample(70*time.Millisecond, 20*time.Millisecond)
+	if cc.LatestRtt() != 50*time.Millisecond {
+		t.Fatalf("a 70 ms sample with 20 ms of ACK delay: latest %v, want 50ms", cc.LatestRtt())
+	}
+	sample(60*time.Millisecond, 20*time.Millisecond) // 60 < 50 + 20: not credible, stands
+	if cc.LatestRtt() != 60*time.Millisecond {
+		t.Fatalf("a 60 ms sample with 20 ms of ACK delay: latest %v, want 60ms unadjusted", cc.LatestRtt())
+	}
+	sample(45*time.Millisecond, 10*time.Millisecond) // min_rtt from the unadjusted 45
+	if cc.MinRtt() != 45*time.Millisecond {
+		t.Fatalf("min_rtt %v, want 45ms", cc.MinRtt())
+	}
+	sample(100*time.Millisecond, 60*time.Millisecond) // delay capped at MaxAckDelay
+	if want := 100*time.Millisecond - MaxAckDelay; cc.LatestRtt() != want {
+		t.Fatalf("a 100 ms sample with 60 ms of ACK delay: latest %v, want %v", cc.LatestRtt(), want)
+	}
 }
